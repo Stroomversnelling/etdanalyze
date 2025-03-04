@@ -16,17 +16,20 @@ requires-python = ">= 3.9"
 dependencies = [
     "pandas>=2.2",
     "ibis-framework",
-    "etdtransform",
-    "etdmap",
     "pyarrow_hotfix",
     "ibis-framework[duckdb]",
     "openpyxl",
+    "matplotlib"
 ]
 keywords = ["stroomversnelling", "energietransitie", "warmtepomp"]
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["etdanalyze*"]
+exclude = ["demo_notebooks*"]
 
 [project.urls]
-repository = "https://github.com/Stroomversnelling/etdmap"
+repository = "https://github.com/Stroomversnelling/etdanalyze"
 
 [project.optional-dependencies]
 docs = [
