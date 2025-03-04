@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "etdanalyze"
+version = "0.1.0"
+description = "Analysis helper functions for EnergieTransitieDataset."
+readme = "README.md"
+authors = [{ name = "Nicolas Dickinson", email = "dickinson@washnote.com"}]
+maintainers = [
+    {name = "Nicolas Dickinson", email = "dickinson@washnote.com"},
+    {name = 'Petra Izeboud', email = 'petra.izeboud@live.nl'},
+    ]
+requires-python = ">= 3.9"
+dependencies = [
+    "pandas>=2.2",
+    "ibis-framework",
+    "etdtransform",
+    "etdmap",
+    "pyarrow_hotfix",
+    "ibis-framework[duckdb]",
+    "openpyxl",
+]
+keywords = ["stroomversnelling", "energietransitie", "warmtepomp"]
+
+
+[project.urls]
+repository = "https://github.com/Stroomversnelling/etdmap"
+
+[project.optional-dependencies]
+docs = [
+    "sphinx",
+    "sphinx-rtd-theme",
+    "numpydoc",
+    "myst-parser",
+]
+ruffing = ["ruff"]
+pytesting = ["pytest>=7"]
+dev = ["pre-commit"]
+
+[tool.ruff]
+line-length = 88
+indent-width = 4
+
+[tool.ruff.lint]
+# Enable pycodestyle (E, W), pyflakes (F) and Flake8 bugbear (B)
+# as well as Ruff-specific-rules (RUF) and isort
+select = ["E", "F", "B", "W", "RUF", "I"]
+
+
+ignore = [
+    # Avoid enforcing line-length violations
+    "E501",
+    # module level import not at top of file
+    "E402",
+    # do not assign a lambda expression, use a def
+    "E731",
+]
+
+# 3. Avoid trying to fix flake8-bugbear (`B`) violations.
+unfixable = ["B"]
+
+# 4. Ignore `E402` (import violations) in all `__init__.py` files, and in selected subdirectories.
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402"]
+"**/{tests}/*" = ["E402"]
+
+[tool.ruff.format]
+# 5. Use double quotes in `ruff format`.
+quote-style = "double"
