@@ -10,17 +10,17 @@ __pycache__/
 *.log
 */*.log
 *.csv
-!etdmodel.csv
 *.xlsx
 *.ipynb
 *.html
-test_output.txt
 *.parquet
 */*.parquet
 *.yaml
+*.ipynb
 
 # gitignore exceptions to above extensions
 !.\config_test_template.yaml
+!.\config_template.yaml
 
 # Distribution / packaging
 .Python
@@ -41,6 +41,9 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+.env
+.venv
+demo_notebooks/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

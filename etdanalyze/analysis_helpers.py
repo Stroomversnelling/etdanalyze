@@ -53,14 +53,14 @@ def aggregate_project_metrics(hh_table, project_table, col_list):
     return hh_agg_per_project
 
 
-def convert_interval_to_multiplier(interval):
+def convert_to_KWH(interval):
     """
-    Convert interval to multiplier using a dict
+    Convert data to KWH.
 
     Parameters
     ----------
     interval : str
-        The interval between timestamps (e.g. "5min")
+        The interval between timestamps (e.g. "5min", "6h")
 
     Returns
     -------
@@ -102,7 +102,7 @@ def normalize_100m2(hh_table: Table, col_names: list, interval: str) -> Table:
     if "Oppervlakte" not in hh_table.columns:
         raise ValueError("Missing column 'Oppervlakte' in ibis table.")
 
-    multiplier = convert_interval_to_multiplier(interval)
+    multiplier = convert_to_KWH(interval)
 
     kwargs={}
     for col in col_names:
