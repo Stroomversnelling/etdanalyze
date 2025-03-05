@@ -5,6 +5,8 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
 
+from . import analysis_helpers
+
 
 def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=None, save_fig_path=None):
     """
@@ -14,14 +16,12 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
     ----------
     df : pd.DataFrame
         DataFrame containing daily profile with at least column "ProjectIdBSV".
-    title : str
-        Title to be used in the plot.
     plot_var : str
         The column name representing the variable to plot.
+    title : str
+        Optional. Title to be used in the plot. If not defined the plot_var_name or plot_var is used.
     plot_var_name : str
         A descriptive name for the plot variable (for axis labeling).
-    plot_interval : str
-        The time interval (e.g., "15min", "1hour").
     project_id: int|str:
         Optional: when provided the df is filtered to only contain data of that project.
     save_fig_path : str, optional
@@ -120,31 +120,29 @@ def plot_daily_profile_combined(
         save_fig_path: Optional[str]=None
         ):
     """
-    Plot the mean values of multiple variables for a specific project over time.
+    Plot the mean values of multiple variables over time for a specific project (if provided).
 
-    This function visualizes the average time-of-day patterns for a given project's variables
-    during a specified season. Multiple variables are plotted together on the same graph
-    with distinct colors. The plot can be either displayed or saved to a file.
+    This function visualizes the average time-of-day patterns for multiple variables within a dataset.
+    If a `project_id` is provided, it filters the data to only plot that specific project.
+    The plot can either be displayed or saved to a specified file path.
 
     Parameters
     ----------
-    season_df : pandas.DataFrame
-        DataFrame containing the seasonal data with columns including "ProjectIdBSV",
-        "time_of_day", and the variables to be plotted.
-    season_name : str
-        Name of the season (e.g., "Summer" or "Winter") to display in the plot title.
-    project_id : int or str
-        Identifier of the project for which the variables will be plotted.
+    df : pandas.DataFrame
+        DataFrame containing the data with columns including "ProjectIdBSV",
+        and the variables to be plotted.
     plot_vars : list of str
-        List of column names in `season_df` representing the variables to plot.
-    plot_interval : str, optional
-        Time interval for the plot (e.g., "5min", "15min"). Default is "5min".
+        List of column names in `df` representing the variables to plot.
+    title : str, optional
+        Title of the plot. Default is "Variabelen per 100m2 (kW)".
     plot_var_names : list of str, optional
         Custom display names for the variables in the legend. If not provided,
         the original column names from `plot_vars` will be used.
+    project_id : int or str, optional
+        Identifier of the project to filter the data. If `None`, all data is plotted.
     save_fig_path : str, optional
-        File path to save the plot. If provided, the plot will be saved and not displayed.
-        If not provided, the figure object will be returned.
+        File path to save the plot. If provided, the plot will be saved to this path.
+        If not provided, the function returns the figure object.
 
     Returns
     -------
@@ -154,21 +152,21 @@ def plot_daily_profile_combined(
 
     Notes
     -----
-    - Ensure `plot_vars` contains valid columns in `season_df`.
+    - Ensure `plot_vars` contains valid columns in `df`.
     - Uses `pd.to_datetime` to parse "time_of_day" for proper time-based plotting.
-    - Distinct colors are assigned to each variable for better visualization.
+    - If `plot_var_names` is not provided, original column names are used for the legend.
 
     Examples
     --------
-    >>> plot_average_graphs_together(
-    ...     season_df=data,
-    ...     season_name="Summer",
-    ...     project_id=101,
+    >>> plot_daily_profile_combined(
+    ...     df=data,
     ...     plot_vars=["ElectricityUsage", "SolarOutput"],
+    ...     title="Daily Profile",
     ...     plot_var_names=["Electricity (kW)", "Solar Power (kW)"],
-    ...     save_fig_path="summer_project_101.png"
+    ...     project_id=101,
+    ...     save_fig_path="daily_profile.png"
     ... )
-    Saved plot to summer_project_101.png
+    Saved plot to daily_profile.png
     """
     # add time_of_day column that sets the times correctly.
     df = etdtransform.calculated_columns.add_normalized_datetime(df)
@@ -207,6 +205,79 @@ def plot_daily_profile_combined(
     plt.title(f"{title}")
     plt.grid(True)
     plt.tight_layout()
+
+    # Save or return figure
+    if save_fig_path:
+        fig.savefig(save_fig_path, dpi=300)
+        print(f"Saved plot to {save_fig_path}")
+        plt.close(fig)
+    else:
+        return fig
+
+
+def plot_load_duration_curve(
+    df: pd.DataFrame,
+    diff_column: str,
+    interval: str,
+    project_id: Optional[int|str]=None,
+    save_fig_path: Optional[str]=None,
+) -> None:
+    """
+    Plot the load duration curve for a given variable.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame.
+    diff_column : str
+        Column representing the difference to plot.
+    interval : str
+        Time interval for aggregation (e.g., "5min", "hourly").
+    project_id : optional, int|str
+        Project identifier to filter data to plot.
+    save_fig_path : str, optional
+        File path to save the plot. If provided, the plot will be saved to this path.
+        If not provided, the function returns the figure object.
+
+    Returns
+    -------
+    matplotlib.figure.Figure or None
+        Returns the figure object if `save_fig_path` is not provided. Otherwise, saves the plot
+        to the specified path and returns `None`.
+    """
+    # Filter and sort
+    multiplier = etdtransform.calculated_columns.switch_multiplier(interval)
+    filtered_df = analysis_helpers.filter_between_upper_lower_bounds(
+        df,
+        diff_column,
+        project_id)
+
+    sorted_values = filtered_df[diff_column].sort_values(ascending=False).reset_index(drop=True)
+
+    x_data = range(1, len(sorted_values) + 1)
+    y_data = sorted_values * multiplier
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(16, 12))
+
+    # Determine label for line
+    if project_id is not None:
+        label = f"Project {project_id}"
+    else:
+        label = f"{diff_column}"
+    ax.plot(x_data, y_data, marker="none", label=label)
+
+    plt.title(f"Load Duration Curve ({interval}): {diff_column.replace('Diff', 'Netto')}")
+    ax.set_xlabel("Time (1 year)")
+    ax.set_ylabel("Power (kW)")
+    ax.legend()
+    plt.grid(True)
+    plt.tight_layout()
+
+    # Some statistics
+    threshold = 1.5
+    percentage_over = (y_data > threshold).mean() * 100
+    print(f"{diff_column} stats for {interval} - Project {project_id}: {percentage_over:.2f}% above {threshold} kW")
 
     # Save or return figure
     if save_fig_path:

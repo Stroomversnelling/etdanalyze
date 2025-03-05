@@ -1,5 +1,7 @@
 import re
+from typing import Optional
 
+import pandas as pd
 from ibis import _
 from ibis.expr.types import Table
 
@@ -53,9 +55,9 @@ def aggregate_project_metrics(hh_table, project_table, col_list):
     return hh_agg_per_project
 
 
-def convert_to_KWH(interval):
+def multiplier_to_convert_to_KWH(interval):
     """
-    Convert data to KWH.
+    Calculate multiplier to convert data to KWH.
 
     Parameters
     ----------
@@ -82,7 +84,8 @@ def convert_to_KWH(interval):
 
 
 def normalize_100m2(hh_table: Table, col_names: list, interval: str) -> Table:
-    """Normalize all supplied columns to 100m2
+    """
+    Normalize all supplied columns to 100m2.
 
     Parameters
     ----------
@@ -102,7 +105,7 @@ def normalize_100m2(hh_table: Table, col_names: list, interval: str) -> Table:
     if "Oppervlakte" not in hh_table.columns:
         raise ValueError("Missing column 'Oppervlakte' in ibis table.")
 
-    multiplier = convert_to_KWH(interval)
+    multiplier = multiplier_to_convert_to_KWH(interval)
 
     kwargs={}
     for col in col_names:
@@ -147,3 +150,34 @@ def get_summer_winter_table(ibis_table: Table) -> Table:
     )
 
     return summer_table, winter_table
+
+
+def filter_between_upper_lower_bounds(
+        df: pd.DataFrame,
+        diff_column: str,
+        project_id: Optional[int|str]=None,
+        ) -> pd.DataFrame:
+    """
+    Filter the dataset to stay within upper and lower bounds.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame.
+    diff_column : str
+        Column name to filter based on quantiles and bounds.
+    project_id : optional, int
+        Project identifier to filter by.
+
+    Returns
+    -------
+    pd.DataFrame
+        Filtered DataFrame for the given column (and project if supplied).
+    """
+    if project_id is not None:
+        df = df[df["ProjectIdBSV"] == project_id]
+
+    upper_bound = df[diff_column].quantile(0.99) * 10
+    lower_bound = max(0, df[diff_column].quantile(0.01) * 10)
+
+    return df[(df[diff_column] <= upper_bound) & (df[diff_column] >= lower_bound)]
