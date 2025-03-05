@@ -1,6 +1,7 @@
 import re
 from typing import Optional
 
+import etdtransform
 import pandas as pd
 from ibis import _
 from ibis.expr.types import Table
@@ -10,8 +11,8 @@ def aggregate_project_metrics(hh_table, project_table, col_list):
     """
     Computes aggregated mean metrics per project and reading date.
 
-    This function performs a semi-join between `hh_table` and `project_table` 
-    on the "ReadingDate" and "ProjectIdBSV" columns. It then groups the data by 
+    This function performs a semi-join between `hh_table` and `project_table`
+    on the "ReadingDate" and "ProjectIdBSV" columns. It then groups the data by
     "ProjectIdBSV" and "ReadingDate", calculating the mean for the specified columns.
 
     Parameters
@@ -181,3 +182,62 @@ def filter_between_upper_lower_bounds(
     lower_bound = max(0, df[diff_column].quantile(0.01) * 10)
 
     return df[(df[diff_column] <= upper_bound) & (df[diff_column] >= lower_bound)]
+
+
+def extract_coldest_weeks(
+        df: pd.DataFrame,
+        var: str="TemperatuurRA",
+        project: Optional[str|int]=None
+        ):
+    """
+    Extracts data for the coldest two weeks for each project and interval.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing data of which the coldest weeks need to be determined
+    var : str, optional
+        Column name representing energy consumption (default is "TemperatuurRA").
+    project: optional, str, int
+        The project id to filter data.
+
+    Returns
+    -------
+    dict
+        Dictionary of DataFrames for the coldest two weeks for each project and interval.
+    """
+    # If project is provided, filter df based on corresponding project id.
+    if project is not None:
+        df = df[df["ProjectIdBSV"] == project]
+    df["Koudste2WkTemperatuur"] = etdtransform.calculated_columns.mark_coldest_two_weeks(df, avg_var=var)
+    df_coldest_weeks = df[df["Koudste2WkTemperatuur"]]
+
+    return df_coldest_weeks
+
+
+def extract_highest_peak_weeks(df, var='ElektriciteitsgebruikTotaalNetto', days=6, project=None):
+    """
+    Identify and extract data surrounding the highest energy consumption peak.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Input dataframe containing energy and temperature data.
+   var : str, optional
+        Column name representing energy consumption (default is 'ElektriciteitsgebruikTotaalNetto').
+    days : int, optional
+        Number of days around the peak to extract (default is 6).
+    project: optional, str, int
+        The project id to filter data.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Filtered dataframe containing the data around the peak.
+    """
+    if project is not None:
+        df = df[df["ProjectIdBSV"] == project]
+    df['HoogstePiekWeek'] = etdtransform.calculated_columns.mark_highest_peak(
+        df, var=var, days=days)
+    return df[df['HoogstePiekWeek']]
+

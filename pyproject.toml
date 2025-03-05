@@ -19,7 +19,8 @@ dependencies = [
     "pyarrow_hotfix",
     "ibis-framework[duckdb]",
     "openpyxl",
-    "matplotlib"
+    "matplotlib",
+    "etdtransform @ git+https://github.com/Stroomversnelling/etdtransform@main",
 ]
 keywords = ["stroomversnelling", "energietransitie", "warmtepomp"]
 

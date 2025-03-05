@@ -7,6 +7,66 @@ import pandas as pd
 
 from . import analysis_helpers
 
+# def plot_simple_vars_time(df, plot_var, title=None, plot_var_name=None, project_id=None, save_fig_path=None)
+
+def plot_var_vs_temp(
+        df: pd.DataFrame,
+        var: str,
+        interval:str='5min',
+        title:str='',
+        plot_var_name: Optional[str]=None,
+        project_id: Optional[str|int]=None
+        ):
+    """
+    Plot var over time, for a specific project if supplied.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing the dataset.
+    var : str
+        The variable to plot (e.g., 'ElektriciteitsgebruikTotaalNetto').
+    interval: str
+        interval of df data. choice from '5min', '15min', '60min', '6h', '24h'
+    title: str
+        title for the graph
+    plot_var_name : str
+        Label for the y-axis representing the energy variable.
+    project_id : int
+        The ProjectIdBSV to filter on.
+    """
+    if project_id is not None:
+        df = df[df['ProjectIdBSV'] == project_id].copy()
+
+    # If no specific label name is supplied, use variable name.
+    if plot_var_name is None:
+        plot_var_name=var
+
+    plot_multiplier = etdtransform.calculated_columns.switch_multiplier(interval)
+    df[f'{var}KW'] = df[var] * plot_multiplier
+    df = df.sort_values('ReadingDate')
+
+    fig, ax1 = plt.subplots(figsize=(16, 12))
+    ax2 = ax1.twinx()
+
+    ax1.plot(df['ReadingDate'], df[f'{var}KW'], linestyle='-', linewidth=0.75, label=f'Project {project_id}')
+    ax1.set_ylabel(plot_var_name)
+
+    ax2.plot(df['ReadingDate'], df['Temperatuur'], color='orange', linewidth=0.75, label='Temperatuur (°C)')
+    ax2.set_ylabel('Temperatuur (°C)', color='orange')
+
+    ax1.set_xlabel('Datum')
+
+    ax1.xaxis.set_major_locator(mdates.DayLocator(interval=1))
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+
+    fig.autofmt_xdate(rotation=45)
+
+    plt.title(title)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
 
 def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=None, save_fig_path=None):
     """
@@ -111,13 +171,14 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
         return fig
 
 
-def plot_daily_profile_combined(
+def plot_daily_profile_mean_combined(
         df: pd.DataFrame,
         plot_vars: list[str],
         title: str="Variabelen per 100m2 (kW)",
         plot_var_names: Optional[list[str]]=None,
         project_id: Optional[str|int]=None,
-        save_fig_path: Optional[str]=None
+        save_fig_path: Optional[str]=None,
+
         ):
     """
     Plot the mean values of multiple variables over time for a specific project (if provided).
@@ -172,7 +233,7 @@ def plot_daily_profile_combined(
     df = etdtransform.calculated_columns.add_normalized_datetime(df)
 
     fig, ax = plt.subplots(figsize=(16, 12))
-    colors = [plt.cm.viridis_r(i / (len(plot_vars) - 1)) for i in range(len(plot_vars))]  # Assign distinct colors
+    colors = [plt.cm.viridis_r(i / (len(plot_vars))) for i in range(len(plot_vars))]  # Assign distinct colors
 
     # if no distinct names for plot labels are supplied
     # we use the original var names as label-name
