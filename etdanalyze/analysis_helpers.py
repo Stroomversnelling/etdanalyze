@@ -179,7 +179,12 @@ def filter_between_upper_lower_bounds(
         df = df[df["ProjectIdBSV"] == project_id]
 
     upper_bound = df[diff_column].quantile(0.99) * 10
-    lower_bound = max(0, df[diff_column].quantile(0.01) * 10)
+
+    lower_bound = df[diff_column].min()
+    if lower_bound < 0 and df[diff_column].quantile(0.01) < 0:
+        lower_bound = df[diff_column].quantile(0.01) * 10
+    else:
+        lower_bound = 0
 
     return df[(df[diff_column] <= upper_bound) & (df[diff_column] >= lower_bound)]
 

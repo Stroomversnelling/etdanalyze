@@ -282,6 +282,7 @@ def plot_load_duration_curve(
     interval: str,
     project_id: Optional[int|str]=None,
     save_fig_path: Optional[str]=None,
+    filter_upper_lower_bounds: bool=True
 ) -> None:
     """
     Plot the load duration curve for a given variable.
@@ -308,10 +309,14 @@ def plot_load_duration_curve(
     """
     # Filter and sort
     multiplier = etdtransform.calculated_columns.switch_multiplier(interval)
-    filtered_df = analysis_helpers.filter_between_upper_lower_bounds(
-        df,
-        diff_column,
-        project_id)
+
+    if filter_upper_lower_bounds:
+        filtered_df = analysis_helpers.filter_between_upper_lower_bounds(
+            df,
+            diff_column,
+            project_id)
+    else:
+        filtered_df = df
 
     sorted_values = filtered_df[diff_column].sort_values(ascending=False).reset_index(drop=True)
 
