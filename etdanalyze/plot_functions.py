@@ -3,6 +3,7 @@ from typing import Optional
 import etdtransform
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import pandas as pd
 
 from . import analysis_helpers
@@ -268,6 +269,364 @@ def plot_daily_profile_mean_combined(
     plt.tight_layout()
 
     # Save or return figure
+    if save_fig_path:
+        fig.savefig(save_fig_path, dpi=300)
+        print(f"Saved plot to {save_fig_path}")
+        plt.close(fig)
+    else:
+        return fig
+
+
+def plot_weekly_profile(
+        df: pd.DataFrame,
+        plot_var: str,
+        title: Optional[str] = None,
+        plot_var_name: Optional[str] = None,
+        project_id: Optional[int | str] = None,
+        save_fig_path: Optional[str] = None,
+):
+    """
+    Plot the weekly profile (weekprofiel) for a variable.
+
+    Shows mean values for each (day-of-week, hour-of-day) combination,
+    producing 168 data points across 7 day panels on a single x-axis.
+    Min/q1/median/q3/max bands are shown as shading and thin lines.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with a 'ReadingDate' column and the plot_var column.
+    plot_var : str
+        Column name of the variable to plot.
+    title : str, optional
+        Plot title. Defaults to "Weekly profile: {plot_var_name}".
+    plot_var_name : str, optional
+        Y-axis label. Defaults to plot_var.
+    project_id : int or str, optional
+        When provided, filters df to that project.
+    save_fig_path : str, optional
+        File path to save the figure. If None, the figure is returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure or None
+    """
+    if project_id is not None:
+        df = df[df["ProjectIdBSV"] == project_id].copy()
+    if plot_var_name is None:
+        plot_var_name = plot_var
+
+    df = df.copy()
+    df["day_of_week"] = df["ReadingDate"].dt.dayofweek   # 0=Mon, 6=Sun
+    df["hour_of_day"] = df["ReadingDate"].dt.hour
+    df["week_slot"] = df["day_of_week"] * 24 + df["hour_of_day"]
+
+    grouped = df.groupby("week_slot")[plot_var]
+    summary = grouped.agg(["mean", "min", "max"]).reset_index()
+    summary["q1"] = grouped.quantile(0.25).values
+    summary["q3"] = grouped.quantile(0.75).values
+    summary["median"] = grouped.median().values
+
+    fig, ax = plt.subplots(figsize=(16, 6))
+    ax.fill_between(summary["week_slot"], summary["min"], summary["max"],
+                    alpha=0.12, color="steelblue", label="min–max")
+    ax.fill_between(summary["week_slot"], summary["q1"], summary["q3"],
+                    alpha=0.25, color="steelblue", label="q1–q3")
+    ax.plot(summary["week_slot"], summary["median"],
+            linewidth=0.9, color="steelblue", alpha=0.7, label="median")
+    ax.plot(summary["week_slot"], summary["mean"],
+            linewidth=2, color="purple", label="mean")
+
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    for day in range(7):
+        ax.axvline(day * 24, color="gray", linewidth=0.5, linestyle="--")
+
+    ax.set_xlabel("Day of week / hour")
+    ax.set_ylabel(plot_var_name)
+    ax.xaxis.set_major_locator(mticker.MultipleLocator(24))
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(
+        lambda x, _: day_names[int(x // 24)] if 0 <= int(x // 24) < 7 else ""
+    ))
+    ax.legend()
+    plt.title(title or f"Weekly profile: {plot_var_name}")
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+
+    if save_fig_path:
+        fig.savefig(save_fig_path, dpi=300)
+        print(f"Saved plot to {save_fig_path}")
+        plt.close(fig)
+    else:
+        return fig
+
+
+def plot_annual_profile(
+        df: pd.DataFrame,
+        plot_var: str,
+        title: Optional[str] = None,
+        plot_var_name: Optional[str] = None,
+        project_id: Optional[int | str] = None,
+        save_fig_path: Optional[str] = None,
+):
+    """
+    Plot the annual profile (jaarprofiel) for a variable.
+
+    Shows mean and q1–q3 band for each day-of-year (1–366),
+    revealing seasonal patterns across the year.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with a 'ReadingDate' column and the plot_var column.
+    plot_var : str
+        Column name of the variable to plot.
+    title : str, optional
+        Plot title. Defaults to "Annual profile: {plot_var_name}".
+    plot_var_name : str, optional
+        Y-axis label. Defaults to plot_var.
+    project_id : int or str, optional
+        When provided, filters df to that project.
+    save_fig_path : str, optional
+        File path to save the figure. If None, the figure is returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure or None
+    """
+    if project_id is not None:
+        df = df[df["ProjectIdBSV"] == project_id].copy()
+    if plot_var_name is None:
+        plot_var_name = plot_var
+
+    df = df.copy()
+    df["day_of_year"] = df["ReadingDate"].dt.dayofyear
+
+    grouped = df.groupby("day_of_year")[plot_var]
+    summary = grouped.mean().reset_index(name="mean")
+    summary["q1"] = grouped.quantile(0.25).values
+    summary["q3"] = grouped.quantile(0.75).values
+
+    fig, ax = plt.subplots(figsize=(16, 6))
+    ax.fill_between(summary["day_of_year"], summary["q1"], summary["q3"],
+                    alpha=0.25, color="steelblue", label="q1–q3")
+    ax.plot(summary["day_of_year"], summary["mean"],
+            linewidth=1.5, color="purple", label="mean")
+
+    month_starts = [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
+    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    for start, name in zip(month_starts, month_names):
+        ax.axvline(start, color="gray", linewidth=0.4, linestyle="--")
+        ax.text(start + 0.5, ax.get_ylim()[1], name, fontsize=7, color="gray", va="top")
+
+    ax.set_xlabel("Day of year")
+    ax.set_ylabel(plot_var_name)
+    ax.legend()
+    plt.title(title or f"Annual profile: {plot_var_name}")
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+
+    if save_fig_path:
+        fig.savefig(save_fig_path, dpi=300)
+        print(f"Saved plot to {save_fig_path}")
+        plt.close(fig)
+    else:
+        return fig
+
+
+def plot_cop_vs_temp(
+        df: pd.DataFrame,
+        cop_col: str = "COP",
+        temp_col: str = "TemperatuurBuitenWarmtepomp",
+        title: Optional[str] = None,
+        project_id: Optional[int | str] = None,
+        save_fig_path: Optional[str] = None,
+):
+    """
+    Scatter plot of daily average COP against outdoor temperature.
+
+    Each point represents one day. Requires daily-aggregated input
+    (compute daily means before calling).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with cop_col and temp_col columns (daily averages).
+    cop_col : str, optional
+        Column name for COP values. Default is 'COP'.
+    temp_col : str, optional
+        Column name for temperature values. Default is 'TemperatuurBuitenWarmtepomp'.
+    title : str, optional
+        Plot title.
+    project_id : int or str, optional
+        When provided, filters df to that project.
+    save_fig_path : str, optional
+        File path to save the figure. If None, the figure is returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure or None
+    """
+    if project_id is not None:
+        df = df[df["ProjectIdBSV"] == project_id].copy()
+
+    plot_df = df[[temp_col, cop_col]].dropna()
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.scatter(plot_df[temp_col], plot_df[cop_col],
+               alpha=0.4, s=20, color="steelblue")
+    ax.set_xlabel(f"Outdoor temperature (°C) [{temp_col}]")
+    ax.set_ylabel(f"COP [{cop_col}]")
+    plt.title(title or "COP vs outdoor temperature")
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+
+    if save_fig_path:
+        fig.savefig(save_fig_path, dpi=300)
+        print(f"Saved plot to {save_fig_path}")
+        plt.close(fig)
+    else:
+        return fig
+
+
+def plot_cop_vs_delta_t(
+        df: pd.DataFrame,
+        cop_col: str = "COP",
+        supply_temp_col: str = "TemperatuurAfgifteAanvoer",
+        outdoor_temp_col: str = "TemperatuurBuitenWarmtepomp",
+        title: Optional[str] = None,
+        project_id: Optional[int | str] = None,
+        save_fig_path: Optional[str] = None,
+):
+    """
+    Scatter plot of daily average COP against the temperature lift (delta-T).
+
+    Delta-T = TemperatuurAfgifteAanvoer - TemperatuurBuitenWarmtepomp.
+    Relevant for air-source heat pumps where efficiency depends on the
+    difference between supply and source temperature.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with cop_col, supply_temp_col, and outdoor_temp_col columns.
+    cop_col : str, optional
+        Column name for COP values. Default is 'COP'.
+    supply_temp_col : str, optional
+        Supply (flow) temperature column. Default is 'TemperatuurAfgifteAanvoer'.
+    outdoor_temp_col : str, optional
+        Outdoor temperature column. Default is 'TemperatuurBuitenWarmtepomp'.
+    title : str, optional
+        Plot title.
+    project_id : int or str, optional
+        When provided, filters df to that project.
+    save_fig_path : str, optional
+        File path to save the figure. If None, the figure is returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure or None
+    """
+    if project_id is not None:
+        df = df[df["ProjectIdBSV"] == project_id].copy()
+
+    df = df.copy()
+    df["delta_T"] = df[supply_temp_col] - df[outdoor_temp_col]
+    plot_df = df[["delta_T", cop_col]].dropna()
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.scatter(plot_df["delta_T"], plot_df[cop_col],
+               alpha=0.4, s=20, color="steelblue")
+    ax.set_xlabel(f"Temperature lift ΔT (°C)  [{supply_temp_col} − {outdoor_temp_col}]")
+    ax.set_ylabel(f"COP [{cop_col}]")
+    plt.title(title or "COP vs temperature lift (ΔT)")
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+
+    if save_fig_path:
+        fig.savefig(save_fig_path, dpi=300)
+        print(f"Saved plot to {save_fig_path}")
+        plt.close(fig)
+    else:
+        return fig
+
+
+def plot_energy_signature(
+        df: pd.DataFrame,
+        energy_col: str,
+        temp_col: str,
+        fit: Optional[dict] = None,
+        title: Optional[str] = None,
+        energy_label: Optional[str] = None,
+        project_id: Optional[int | str] = None,
+        save_fig_path: Optional[str] = None,
+):
+    """
+    Scatter plot of energy use per m² against outdoor temperature (energy signature).
+
+    Optionally overlays the fitted heating and DHW regression lines from
+    fit_heat_signature(), including the stookgrens (heating cut-off temperature).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with energy_col and temp_col columns (typically monthly averages).
+    energy_col : str
+        Column with energy values (e.g. W/m² or kWh/m²).
+    temp_col : str
+        Column with outdoor temperature (°C).
+    fit : dict, optional
+        Output of analysis_helpers.fit_heat_signature(). When provided, regression
+        lines for heating and DHW are drawn and the stookgrens is annotated.
+    title : str, optional
+        Plot title. Defaults to "Energy signature".
+    energy_label : str, optional
+        Y-axis label. Defaults to energy_col.
+    project_id : int or str, optional
+        When provided, filters df to that project.
+    save_fig_path : str, optional
+        File path to save the figure. If None, the figure is returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure or None
+    """
+    if project_id is not None:
+        df = df[df["ProjectIdBSV"] == project_id].copy()
+    if energy_label is None:
+        energy_label = energy_col
+
+    plot_df = df[[temp_col, energy_col]].dropna()
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.scatter(plot_df[temp_col], plot_df[energy_col],
+               alpha=0.5, s=25, color="steelblue", label="Monthly avg")
+
+    if fit is not None:
+        t_min, t_max = plot_df[temp_col].min(), plot_df[temp_col].max()
+        t_line = pd.Series([t_min, t_max])
+
+        if fit.get("heating_slope") is not None:
+            y_line = fit["heating_slope"] * t_line + fit["heating_intercept"]
+            ax.plot(t_line, y_line, color="tomato", linewidth=2, label="Heating fit")
+
+        if fit.get("dhw_level") is not None:
+            ax.axhline(fit["dhw_level"], color="orange", linewidth=1.5,
+                       linestyle="--", label=f"DHW level ({fit['dhw_level']:.1f})")
+
+        if fit.get("stookgrens") is not None:
+            sg = fit["stookgrens"]
+            ax.axvline(sg, color="gray", linewidth=1, linestyle=":")
+            ax.text(sg + 0.2, ax.get_ylim()[0],
+                    f"Stookgrens\n{sg:.1f}°C",
+                    fontsize=8, color="gray", va="bottom")
+
+    ax.set_xlabel(f"Outdoor temperature (°C) [{temp_col}]")
+    ax.set_ylabel(energy_label)
+    ax.legend()
+    plt.title(title or "Energy signature")
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+
     if save_fig_path:
         fig.savefig(save_fig_path, dpi=300)
         print(f"Saved plot to {save_fig_path}")
