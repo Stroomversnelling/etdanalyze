@@ -468,6 +468,34 @@ def calculate_cop(
 # Heat signature fitting
 # ---------------------------------------------------------------------------
 
+def compute_stats_table(
+        df: pd.DataFrame,
+        group_cols: list,
+        value_cols: list,
+) -> pd.DataFrame:
+    """
+    Descriptive stats (mean/median/std/min/max/q1/q3/count) for each value column,
+    grouped by group_cols.
+
+    Returns long-format DataFrame: one row per (group keys × variable) with
+    columns: variable, *group_cols, mean, median, std, min, max, q1, q3, count.
+    Columns not present in df are silently skipped.
+    """
+    results = []
+    for col in value_cols:
+        if col not in df.columns:
+            continue
+        grp = df.dropna(subset=[col]).groupby(group_cols)[col]
+        stats = grp.agg(["mean", "median", "std", "min", "max", "size"]).reset_index()
+        stats = stats.rename(columns={"size": "count"})
+        q = grp.quantile([0.25, 0.75]).unstack(level=-1).reset_index()
+        q.columns = list(group_cols) + ["q1", "q3"]
+        stats = stats.merge(q, on=group_cols, how="left")
+        stats.insert(0, "variable", col)
+        results.append(stats)
+    return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+
+
 def fit_heat_signature(
         df: pd.DataFrame,
         energy_col: str,
@@ -480,7 +508,7 @@ def fit_heat_signature(
     Fit linear regression curves for the heating and DHW (domestic hot water) components
     of the energy signature, and find the stookgrens (heating cut-off temperature).
 
-    The energy signature plots energy use per m² against outdoor temperature. For heat
+    The energy signature plots energy use per m2 against outdoor temperature. For heat
     pump buildings it shows two regions:
     - Heating region: downward-sloping curve (more energy at lower temperatures)
     - DHW / base region: roughly flat curve (independent of temperature)

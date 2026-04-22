@@ -1,9 +1,11 @@
 from typing import Optional
 
 import etdtransform
+import matplotlib
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import numpy as np
 import pandas as pd
 
 from . import analysis_helpers
@@ -329,9 +331,9 @@ def plot_weekly_profile(
 
     fig, ax = plt.subplots(figsize=(16, 6))
     ax.fill_between(summary["week_slot"], summary["min"], summary["max"],
-                    alpha=0.12, color="steelblue", label="min–max")
+                    alpha=0.12, color="steelblue", label="min-max")
     ax.fill_between(summary["week_slot"], summary["q1"], summary["q3"],
-                    alpha=0.25, color="steelblue", label="q1–q3")
+                    alpha=0.25, color="steelblue", label="q1-q3")
     ax.plot(summary["week_slot"], summary["median"],
             linewidth=0.9, color="steelblue", alpha=0.7, label="median")
     ax.plot(summary["week_slot"], summary["mean"],
@@ -408,7 +410,7 @@ def plot_annual_profile(
 
     fig, ax = plt.subplots(figsize=(16, 6))
     ax.fill_between(summary["day_of_year"], summary["q1"], summary["q3"],
-                    alpha=0.25, color="steelblue", label="q1–q3")
+                    alpha=0.25, color="steelblue", label="q1-q3")
     ax.plot(summary["day_of_year"], summary["mean"],
             linewidth=1.5, color="purple", label="mean")
 
@@ -536,9 +538,9 @@ def plot_cop_vs_delta_t(
     fig, ax = plt.subplots(figsize=(10, 7))
     ax.scatter(plot_df["delta_T"], plot_df[cop_col],
                alpha=0.4, s=20, color="steelblue")
-    ax.set_xlabel(f"Temperature lift ΔT (°C)  [{supply_temp_col} − {outdoor_temp_col}]")
+    ax.set_xlabel(f"Temperature lift dT (degC)  [{supply_temp_col} - {outdoor_temp_col}]")
     ax.set_ylabel(f"COP [{cop_col}]")
-    plt.title(title or "COP vs temperature lift (ΔT)")
+    plt.title(title or "COP vs temperature lift (dT)")
     plt.grid(True, alpha=0.4)
     plt.tight_layout()
 
@@ -617,7 +619,7 @@ def plot_energy_signature(
             sg = fit["stookgrens"]
             ax.axvline(sg, color="gray", linewidth=1, linestyle=":")
             ax.text(sg + 0.2, ax.get_ylim()[0],
-                    f"Stookgrens\n{sg:.1f}°C",
+                    f"Stookgrens\n{sg:.1f}degC",
                     fontsize=8, color="gray", va="bottom")
 
     ax.set_xlabel(f"Outdoor temperature (°C) [{temp_col}]")
@@ -630,6 +632,199 @@ def plot_energy_signature(
     if save_fig_path:
         fig.savefig(save_fig_path, dpi=300)
         print(f"Saved plot to {save_fig_path}")
+        plt.close(fig)
+    else:
+        return fig
+
+
+def plot_monthly_profile(
+        df: pd.DataFrame,
+        plot_var: str,
+        title: Optional[str] = None,
+        plot_var_name: Optional[str] = None,
+        save_fig_path: Optional[str] = None,
+):
+    """
+    Plot the monthly profile (maandprofiel) as a heatmap: 12 months x 24 hours = 288 slots.
+
+    Each cell shows the mean value of plot_var for that (month, hour-of-day) combination,
+    aggregated over all rows in df. The heatmap is compact and directly comparable across
+    variables and domains.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with a 'ReadingDate' datetime column and the plot_var column.
+    plot_var : str
+        Column name of the variable to plot.
+    title : str, optional
+        Plot title. Defaults to "Monthly profile: {plot_var_name}".
+    plot_var_name : str, optional
+        Colorbar label and title suffix. Defaults to plot_var.
+    save_fig_path : str, optional
+        File path to save the figure. If None, the figure is returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure or None
+    """
+    if plot_var_name is None:
+        plot_var_name = plot_var
+
+    df = df.copy()
+    df["month"] = df["ReadingDate"].dt.month
+    df["hour_of_day"] = df["ReadingDate"].dt.hour
+
+    grouped = df.groupby(["month", "hour_of_day"])[plot_var].mean().reset_index()
+    pivot = grouped.pivot(index="hour_of_day", columns="month", values=plot_var)
+
+    # Ensure all 12 months and 24 hours are represented
+    pivot = pivot.reindex(index=range(24), columns=range(1, 13))
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    im = ax.imshow(
+        pivot.values,
+        aspect="auto",
+        origin="upper",
+        cmap="RdYlBu_r",
+        interpolation="nearest",
+    )
+    plt.colorbar(im, ax=ax, label=plot_var_name)
+
+    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    ax.set_xticks(range(12))
+    ax.set_xticklabels(month_names)
+    ax.set_yticks(range(0, 24, 2))
+    ax.set_yticklabels([f"{h:02d}:00" for h in range(0, 24, 2)])
+    ax.set_xlabel("Month")
+    ax.set_ylabel("Hour of day")
+    plt.title(title or f"Monthly profile: {plot_var_name}")
+    plt.tight_layout()
+
+    if save_fig_path:
+        fig.savefig(save_fig_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        return fig
+
+
+def plot_boxwhisker_comparison(
+        df: pd.DataFrame,
+        value_col: str,
+        x_group: str,
+        color_group: str,
+        title: Optional[str] = None,
+        y_label: Optional[str] = None,
+        jitter_seed: int = 42,
+        save_fig_path: Optional[str] = None,
+) -> Optional[plt.Figure]:
+    """
+    Box-and-whisker plot with jittered scatter overlay for distribution comparison.
+
+    Designed for two standard views (ADR-005):
+      1. x=ProjectIdBSV, color=WoningType  → cross-project distribution
+      2. x=WoningType, color=ProjectIdBSV  → housing-type distribution
+
+    Each x-category gets one box (IQR + whiskers, no outlier markers). Individual
+    data points are overlaid as jittered dots coloured by color_group, so both the
+    within-group spread and the cross-group colour pattern are visible simultaneously.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        One row per observation unit (e.g. per household), with at least value_col,
+        x_group, and color_group columns.
+    value_col : str
+        Numeric column to plot on the y-axis (e.g. 'mean', 'COP_system').
+    x_group : str
+        Categorical column for x-axis positioning (e.g. 'ProjectIdBSV').
+    color_group : str
+        Categorical column for dot colour coding (e.g. 'WoningType').
+    title : str, optional
+        Plot title.
+    y_label : str, optional
+        Y-axis label. Defaults to value_col.
+    jitter_seed : int, optional
+        RNG seed for reproducible horizontal jitter. Default 42.
+    save_fig_path : str, optional
+        File path to save the figure. If None, the figure is returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure or None
+    """
+    plot_df = df[[value_col, x_group, color_group]].dropna()
+    if plot_df.empty:
+        return None
+
+    x_cats = sorted(plot_df[x_group].dropna().unique().tolist(), key=str)
+    c_cats = sorted(plot_df[color_group].dropna().unique().tolist(), key=str)
+    x_pos = {cat: i for i, cat in enumerate(x_cats)}
+
+    cmap = matplotlib.colormaps.get_cmap("tab10")
+    c_colors = {cat: cmap(i % 10) for i, cat in enumerate(c_cats)}
+
+    rng = np.random.default_rng(jitter_seed)
+    fig_width = max(8.0, len(x_cats) * 1.6 + 2.0)
+    fig, ax = plt.subplots(figsize=(fig_width, 6))
+
+    # Boxes (grey fill, no outlier markers — the scatter handles those)
+    box_data = [
+        plot_df[plot_df[x_group] == cat][value_col].dropna().values
+        for cat in x_cats
+    ]
+    ax.boxplot(
+        box_data,
+        positions=range(len(x_cats)),
+        widths=0.45,
+        patch_artist=True,
+        medianprops=dict(color="black", linewidth=1.8),
+        boxprops=dict(facecolor="whitesmoke", alpha=0.7),
+        flierprops=dict(marker="none"),
+        whiskerprops=dict(linewidth=1.0, color="grey"),
+        capprops=dict(linewidth=1.0, color="grey"),
+    )
+
+    # Jittered scatter coloured by color_group
+    legend_added = set()
+    for c_cat in c_cats:
+        c_df = plot_df[plot_df[color_group] == c_cat]
+        for x_cat in x_cats:
+            vals = c_df[c_df[x_group] == x_cat][value_col].dropna().values
+            if len(vals) == 0:
+                continue
+            jitter = rng.uniform(-0.22, 0.22, len(vals))
+            label = str(c_cat) if c_cat not in legend_added else "_nolegend_"
+            if c_cat not in legend_added:
+                legend_added.add(c_cat)
+            ax.scatter(
+                x_pos[x_cat] + jitter,
+                vals,
+                color=c_colors[c_cat],
+                alpha=0.65,
+                s=22,
+                linewidths=0,
+                label=label,
+                zorder=3,
+            )
+
+    ax.set_xticks(range(len(x_cats)))
+    ax.set_xticklabels([str(c) for c in x_cats], rotation=30, ha="right")
+    ax.set_ylabel(y_label or value_col)
+    ax.legend(
+        title=color_group,
+        bbox_to_anchor=(1.01, 1),
+        loc="upper left",
+        borderaxespad=0,
+        fontsize=9,
+    )
+    plt.title(title or f"{value_col} by {x_group}")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+
+    if save_fig_path:
+        fig.savefig(save_fig_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
     else:
         return fig
