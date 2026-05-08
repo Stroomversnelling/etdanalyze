@@ -13,6 +13,7 @@ from etdanalyze.plot_functions import (
     axis_label_with_unit,
     detect_value_range_clusters,
     plot_boxwhisker_comparison,
+    plot_household_range_strips,
     unit_for_column,
 )
 from etdanalyze.analysis_helpers import (
@@ -339,4 +340,84 @@ class TestBoxwhiskerExtensions:
             fig.savefig(out, dpi=150)
         finally:
             plt.close(fig)
+        assert out.exists() and out.stat().st_size > 0
+
+
+# ---------------------------------------------------------------------------
+# plot_household_range_strips  (per-household candlestick)
+# ---------------------------------------------------------------------------
+
+
+class TestPlotHouseholdRangeStrips:
+    """The new helper draws one vertical range strip per household with
+    min-q1-q25-median-q75-q99-max marks, grouped by project. Smoke tests
+    cover the happy path and column-validation."""
+
+    def _frame(self, n_per_project=4):
+        rng = np.random.default_rng(0)
+        rows = []
+        for proj in (1, 2, 3):
+            for i in range(n_per_project):
+                base = 10.0 * proj
+                rows.append({
+                    "HuisIdBSV": f"P{proj}_{i}",
+                    "ProjectIdBSV": proj,
+                    "Dataleverancier": "Watch-E" if proj > 1 else "Factory Zero",
+                    "min": float(base + rng.normal(0, 0.1)),
+                    "quantile_1": float(base + 0.5),
+                    "quantile_25": float(base + 1.0),
+                    "median": float(base + 1.5),
+                    "quantile_75": float(base + 2.0),
+                    "quantile_99": float(base + 2.5),
+                    "max": float(base + 3.0 + rng.uniform(0, 1)),
+                })
+        return pd.DataFrame(rows)
+
+    def test_writes_non_empty_png(self, tmp_path):
+        df = self._frame()
+        out = tmp_path / "strips.png"
+        plot_household_range_strips(
+            df, column_name="ElektriciteitNetgebruikHoog",
+            save_fig_path=str(out),
+        )
+        assert out.exists() and out.stat().st_size > 0
+
+    def test_returns_figure_when_no_path(self):
+        import matplotlib.pyplot as plt
+        df = self._frame()
+        fig = plot_household_range_strips(df)
+        try:
+            assert fig is not None
+            # Single-axis layout (no stacked subplot).
+            assert len(fig.axes) == 1
+        finally:
+            plt.close(fig)
+
+    def test_unit_appears_in_labels_when_column_known(self):
+        import matplotlib.pyplot as plt
+        df = self._frame()
+        fig = plot_household_range_strips(df, column_name="ElektriciteitNetgebruikHoog")
+        try:
+            ylabel = fig.axes[0].get_ylabel()
+            assert "(kWh)" in ylabel
+        finally:
+            plt.close(fig)
+
+    def test_missing_required_column_raises(self):
+        df = pd.DataFrame({"HuisIdBSV": [1], "ProjectIdBSV": [1], "min": [0.0]})
+        with pytest.raises(KeyError, match="missing columns"):
+            plot_household_range_strips(df)
+
+    def test_missing_optional_percentile_columns_silently_drops_segments(self, tmp_path):
+        # min/median/max only -- no q1/q25/q75/q99. Should still render.
+        df = pd.DataFrame({
+            "HuisIdBSV":       ["A", "B", "C"],
+            "ProjectIdBSV":    [1, 1, 2],
+            "Dataleverancier": ["X", "X", "Y"],
+            "min":             [0.0, 1.0, 5.0],
+            "median":          [2.0, 3.0, 7.0],
+            "max":             [4.0, 5.0, 9.0],
+        })
+        out = tmp_path / "strips_minimal.png"
+        plot_household_range_strips(df, save_fig_path=str(out))
         assert out.exists() and out.stat().st_size > 0

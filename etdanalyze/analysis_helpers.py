@@ -716,11 +716,19 @@ def compute_stats_table(
         value_cols: list,
 ) -> pd.DataFrame:
     """
-    Descriptive stats (mean/median/std/min/max/q1/q3/count) for each value column,
-    grouped by group_cols.
+    Descriptive stats for each value column grouped by group_cols.
 
-    Returns long-format DataFrame: one row per (group keys × variable) with
-    columns: variable, *group_cols, mean, median, std, min, max, q1, q3, count.
+    Returns long-format DataFrame: one row per (group keys x variable)
+    with columns: variable, *group_cols, mean, median, std, min, max,
+    q1 (25th percentile), q3 (75th percentile), q01 (1st percentile),
+    q99 (99th percentile), count.
+
+    Note: ``q1`` and ``q3`` are the inter-quartile boundaries (25/75),
+    kept under those names for compatibility with existing analysis
+    scripts that already consume the column. ``q01`` and ``q99`` are
+    the extreme-tail percentiles, useful for distinguishing typical
+    extremes from single-record outliers in min/max.
+
     Columns not present in df are silently skipped.
     """
     results = []
@@ -730,8 +738,8 @@ def compute_stats_table(
         grp = df.dropna(subset=[col]).groupby(group_cols)[col]
         stats = grp.agg(["mean", "median", "std", "min", "max", "size"]).reset_index()
         stats = stats.rename(columns={"size": "count"})
-        q = grp.quantile([0.25, 0.75]).unstack(level=-1).reset_index()
-        q.columns = list(group_cols) + ["q1", "q3"]
+        q = grp.quantile([0.01, 0.25, 0.75, 0.99]).unstack(level=-1).reset_index()
+        q.columns = list(group_cols) + ["q01", "q1", "q3", "q99"]
         stats = stats.merge(q, on=group_cols, how="left")
         stats.insert(0, "variable", col)
         results.append(stats)

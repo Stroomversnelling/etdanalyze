@@ -1102,6 +1102,412 @@ def plot_boxwhisker_comparison(
         return fig
 
 
+def plot_household_range_strips(
+    df: pd.DataFrame,
+    *,
+    project_col: str = "ProjectIdBSV",
+    id_col: str = "HuisIdBSV",
+    color_group: Optional[str] = "Dataleverancier",
+    column_name: Optional[str] = None,
+    title: Optional[str] = None,
+    y_label: Optional[str] = None,
+    save_fig_path: Optional[str] = None,
+    xtick_prefix: str = "Proj ",
+) -> Optional[plt.Figure]:
+    """
+    Dense per-household range strips, grouped by project.
+
+    Each row describes one household's stats for a single variable;
+    each household becomes one vertical 1-pixel-wide strip on the
+    x-axis. Within each strip three nested intervals overlay:
+
+      - lightest layer: ``min`` to ``max`` (full observed range)
+      - mid layer:      ``quantile_1`` to ``quantile_99``
+                        (true tail; ignores single-record extremes)
+      - darkest layer:  ``quantile_25`` to ``quantile_75`` (IQR)
+      - bright dot at:  ``median``
+
+    The intervals are nested so when overlaid the outer band is
+    visible only outside the inner one. Households are coloured by
+    ``color_group``; the three layers reuse the same hue at
+    increasing opacity (0.25 / 0.55 / 0.95) so a denser plot
+    remains legible without changing line thickness.
+
+    Implementation note: rendering is vectorised via
+    ``matplotlib.collections.LineCollection`` -- one collection
+    per band regardless of household count -- so 100s of households
+    render in well under a second. Households are ordered
+    project-first; project tick labels sit at the centre of each
+    project group.
+
+    Missing percentile columns are tolerated; the corresponding
+    band is skipped silently.
+    """
+    from matplotlib.collections import LineCollection
+
+    required = {id_col, project_col, "min", "max", "median"}
+    missing = required - set(df.columns)
+    if missing:
+        raise KeyError(f"plot_household_range_strips: missing columns {missing}")
+
+    plot_df = df.dropna(subset=["min", "max", "median"]).copy()
+    if plot_df.empty:
+        return None
+
+    has_q1  = "quantile_1"  in plot_df.columns
+    has_q25 = "quantile_25" in plot_df.columns
+    has_q75 = "quantile_75" in plot_df.columns
+    has_q99 = "quantile_99" in plot_df.columns
+
+    # Stable order: project first, then household id within project.
+    plot_df = plot_df.sort_values([project_col, id_col], kind="stable").reset_index(drop=True)
+    n = len(plot_df)
+    xs = np.arange(n, dtype=float)
+
+    # Project tick centres: average x within each project block.
+    proj_series = plot_df[project_col].astype(str)
+    project_centres: dict = {}
+    for proj in proj_series.unique():
+        positions = xs[(proj_series == proj).values]
+        if positions.size:
+            project_centres[proj] = float(positions.mean())
+
+    # Per-row colour from color_group (or steel-blue fallback).
+    cmap = matplotlib.colormaps.get_cmap("tab10")
+    if color_group and color_group in plot_df.columns:
+        c_cats = sorted(plot_df[color_group].dropna().astype(str).unique().tolist())
+        color_idx = {c: cmap(i % 10) for i, c in enumerate(c_cats)}
+        rgba_per_row = [
+            color_idx.get(str(c), (0.27, 0.51, 0.71, 1.0))
+            for c in plot_df[color_group]
+        ]
+    else:
+        c_cats = []
+        rgba_per_row = [(0.27, 0.51, 0.71, 1.0)] * n
+
+    def _with_alpha(rgba, a):
+        return (rgba[0], rgba[1], rgba[2], a)
+
+    mins = pd.to_numeric(plot_df["min"], errors="coerce").to_numpy(dtype=float)
+    maxs = pd.to_numeric(plot_df["max"], errors="coerce").to_numpy(dtype=float)
+    medians = pd.to_numeric(plot_df["median"], errors="coerce").to_numpy(dtype=float)
+
+    fig_width = max(8.0, n * 0.10 + 2.0)
+    fig, ax = plt.subplots(figsize=(fig_width, 6), constrained_layout=True)
+
+    # Outer band (min..max) -- lowest opacity.
+    segs_outer = [
+        [(xs[i], mins[i]), (xs[i], maxs[i])] for i in range(n)
+        if not (np.isnan(mins[i]) or np.isnan(maxs[i]))
+    ]
+    if segs_outer:
+        outer_colors = [
+            _with_alpha(rgba_per_row[i], 0.25)
+            for i in range(n)
+            if not (np.isnan(mins[i]) or np.isnan(maxs[i]))
+        ]
+        ax.add_collection(LineCollection(
+            segs_outer, colors=outer_colors, linewidths=1.0, capstyle="butt",
+            zorder=2,
+        ))
+
+    # q1..q99 band -- medium opacity.
+    if has_q1 and has_q99:
+        q1s = pd.to_numeric(plot_df["quantile_1"], errors="coerce").to_numpy(dtype=float)
+        q99s = pd.to_numeric(plot_df["quantile_99"], errors="coerce").to_numpy(dtype=float)
+        segs_q99, q99_colors = [], []
+        for i in range(n):
+            if not (np.isnan(q1s[i]) or np.isnan(q99s[i])):
+                segs_q99.append([(xs[i], q1s[i]), (xs[i], q99s[i])])
+                q99_colors.append(_with_alpha(rgba_per_row[i], 0.55))
+        if segs_q99:
+            ax.add_collection(LineCollection(
+                segs_q99, colors=q99_colors, linewidths=1.0, capstyle="butt",
+                zorder=3,
+            ))
+
+    # q25..q75 band (IQR) -- highest opacity.
+    if has_q25 and has_q75:
+        q25s = pd.to_numeric(plot_df["quantile_25"], errors="coerce").to_numpy(dtype=float)
+        q75s = pd.to_numeric(plot_df["quantile_75"], errors="coerce").to_numpy(dtype=float)
+        segs_iqr, iqr_colors = [], []
+        for i in range(n):
+            if not (np.isnan(q25s[i]) or np.isnan(q75s[i])):
+                segs_iqr.append([(xs[i], q25s[i]), (xs[i], q75s[i])])
+                iqr_colors.append(_with_alpha(rgba_per_row[i], 0.95))
+        if segs_iqr:
+            ax.add_collection(LineCollection(
+                segs_iqr, colors=iqr_colors, linewidths=1.0, capstyle="butt",
+                zorder=4,
+            ))
+
+    # Median markers -- single vectorised scatter.
+    valid_med = ~np.isnan(medians)
+    if valid_med.any():
+        ax.scatter(
+            xs[valid_med], medians[valid_med],
+            c=[rgba_per_row[i] for i in range(n) if valid_med[i]],
+            s=10, marker="o", zorder=5,
+            edgecolors="black", linewidths=0.25,
+        )
+
+    # Project ticks at group centres.
+    if project_centres:
+        ax.set_xticks(list(project_centres.values()))
+        ax.set_xticklabels(
+            [f"{xtick_prefix}{p}" for p in project_centres.keys()],
+            rotation=30, ha="right",
+        )
+    ax.set_xlim(-0.5, n - 0.5)
+    # LineCollection does not auto-trigger y-autoscaling; do it explicitly.
+    ax.relim()
+    ax.autoscale_view(scalex=False, scaley=True)
+    ax.grid(True, axis="y", alpha=0.3)
+
+    base_y = y_label or "value per household"
+    if column_name:
+        u = unit_for_column(column_name)
+        if u:
+            base_y = f"{base_y} ({u})"
+    ax.set_ylabel(base_y)
+
+    base_title = title or (
+        f"{column_name} per household"
+        if column_name else "Per-household range strips"
+    )
+    if column_name:
+        u = unit_for_column(column_name)
+        if u and "(" not in base_title:
+            base_title = f"{base_title} ({u})"
+    ax.set_title(base_title)
+
+    # Build a legend with one entry per color_group category
+    if c_cats:
+        from matplotlib.lines import Line2D
+        handles = [
+            Line2D([0], [0], color=color_idx[c], lw=4) for c in c_cats
+        ]
+        ax.legend(
+            handles, c_cats, title=color_group,
+            bbox_to_anchor=(1.01, 1), loc="upper left",
+            borderaxespad=0, fontsize=9,
+        )
+
+    if save_fig_path:
+        fig.savefig(save_fig_path, dpi=150)
+        plt.close(fig)
+        return None
+    return fig
+
+
+def plot_household_range_heatmap(
+    df: pd.DataFrame,
+    *,
+    project_col: str = "ProjectIdBSV",
+    id_col: str = "HuisIdBSV",
+    column_name: Optional[str] = None,
+    title: Optional[str] = None,
+    y_label: Optional[str] = None,
+    save_fig_path: Optional[str] = None,
+    xtick_prefix: str = "Proj ",
+    n_y_bins: int = 300,
+    exclude_last_percentile: bool = False,
+) -> Optional[plt.Figure]:
+    """
+    Discrete-band per-household range strips: side-by-side columns,
+    no gaps, percentile bands rendered as solid blocks of colour.
+
+    Each household becomes one column on the x-axis. The y-axis is
+    sliced into bins; each cell sits in exactly one of three
+    discrete bands, with a flat colour from a friendly palette:
+
+      - **last percentile** (``#cda4a4``): the outermost 1% on
+        each side -- ``min..q1`` and ``q99..max``. Muted dusty
+        rose so a wide last-percentile band signals the household
+        has extreme outliers without visually drowning the rest.
+      - **tail** (``#f4a261``): ``q1..q25`` and ``q75..q99``.
+        Warm peach -- meaningful but not loud.
+      - **IQR** (``#2a6f97``): ``q25..q75``. Solid deep teal-blue
+        for the interquartile range where the household spends
+        most of its time.
+
+    The median sits as a high-contrast tick (white core with a
+    black outline via path_effects) so it stays visible against
+    every band colour. Outside ``min..max`` cells are transparent.
+
+    Parameters
+    ----------
+    exclude_last_percentile : bool, optional
+        When True, clip the y-axis to ``q1..q99`` (the inner 98%)
+        and skip drawing the last-percentile band entirely. Useful
+        when the extreme outliers stretch the y-axis so far that
+        the IQR is squashed to a few pixels. Default False.
+    n_y_bins : int, optional
+        Vertical resolution. Default 300.
+
+    Required columns: ``id_col``, ``project_col``, ``min``, ``max``,
+    ``median``, ``quantile_1``, ``quantile_25``, ``quantile_75``,
+    ``quantile_99``.
+    """
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+    import matplotlib.patheffects as path_effects
+
+    required = {
+        id_col, project_col,
+        "min", "max", "median",
+        "quantile_1", "quantile_25", "quantile_75", "quantile_99",
+    }
+    missing = required - set(df.columns)
+    if missing:
+        raise KeyError(
+            f"plot_household_range_heatmap: missing columns {missing}"
+        )
+
+    plot_df = df.dropna(subset=[
+        "min", "max", "median",
+        "quantile_1", "quantile_25", "quantile_75", "quantile_99",
+    ]).copy()
+    if plot_df.empty:
+        return None
+
+    plot_df = plot_df.sort_values([project_col, id_col], kind="stable").reset_index(drop=True)
+    n = len(plot_df)
+
+    mins  = plot_df["min"].astype(float).to_numpy()
+    q1s   = plot_df["quantile_1"].astype(float).to_numpy()
+    q25s  = plot_df["quantile_25"].astype(float).to_numpy()
+    meds  = plot_df["median"].astype(float).to_numpy()
+    q75s  = plot_df["quantile_75"].astype(float).to_numpy()
+    q99s  = plot_df["quantile_99"].astype(float).to_numpy()
+    maxs  = plot_df["max"].astype(float).to_numpy()
+
+    if exclude_last_percentile:
+        y_lo = float(np.nanmin(q1s))
+        y_hi = float(np.nanmax(q99s))
+    else:
+        y_lo = float(np.nanmin(mins))
+        y_hi = float(np.nanmax(maxs))
+    if not np.isfinite(y_lo) or not np.isfinite(y_hi) or y_hi <= y_lo:
+        return None
+    y_edges = np.linspace(y_lo, y_hi, n_y_bins + 1)
+    y_centres = (y_edges[:-1] + y_edges[1:]) / 2.0
+
+    grid = y_centres[:, None]  # (n_y_bins, 1)
+    M = mins[None, :]
+    Q1 = q1s[None, :]
+    Q25 = q25s[None, :]
+    Q75 = q75s[None, :]
+    Q99 = q99s[None, :]
+    MAX = maxs[None, :]
+
+    # Discrete band labels:
+    #   1 = last percentile  (min..q1  OR  q99..max)  -- only when shown
+    #   2 = tail             (q1..q25  OR  q75..q99)
+    #   3 = IQR              (q25..q75)
+    # 0 / NaN = outside the displayed band range -> transparent
+    bands = np.zeros((n_y_bins, n), dtype=float)
+    if not exclude_last_percentile:
+        bands[(grid >= M)   & (grid <= Q1)]  = 1
+        bands[(grid >  Q99) & (grid <= MAX)] = 1
+    bands[(grid >  Q1)  & (grid <= Q25)] = 2
+    bands[(grid >  Q75) & (grid <= Q99)] = 2
+    bands[(grid >  Q25) & (grid <= Q75)] = 3
+    bands[bands == 0] = np.nan
+
+    # Friendly palette: muted last-percentile, warm tail, solid IQR.
+    last_color = "#cda4a4"   # dusty rose -- soft, not loud
+    tail_color = "#f4a261"   # warm peach
+    iqr_color  = "#2a6f97"   # deep teal-blue
+    cmap = ListedColormap([last_color, tail_color, iqr_color])
+    cmap.set_bad(color="white", alpha=0.0)
+    norm = BoundaryNorm(boundaries=[0.5, 1.5, 2.5, 3.5], ncolors=cmap.N)
+
+    # Half the previous compact width.
+    fig_width = max(3.0, n * 0.010 + 1.5)
+    fig, ax = plt.subplots(figsize=(fig_width, 5), constrained_layout=True)
+
+    x_edges = np.arange(n + 1) - 0.5
+    masked = np.ma.masked_invalid(bands)
+    ax.pcolormesh(
+        x_edges, y_edges, masked,
+        cmap=cmap, norm=norm,
+        shading="flat", rasterized=True,
+    )
+
+    # Median tick: white core with black outline so it stays visible
+    # against every band colour (rose, peach, and teal).
+    valid_med = ~np.isnan(meds)
+    if valid_med.any():
+        # Clip to displayed y-range when last percentile is excluded
+        # so the median marker doesn't render outside the panel.
+        med_y = meds.copy()
+        if exclude_last_percentile:
+            med_y[(med_y < y_lo) | (med_y > y_hi)] = np.nan
+            valid_med = ~np.isnan(med_y)
+        if valid_med.any():
+            sc = ax.scatter(
+                np.arange(n)[valid_med], med_y[valid_med],
+                c="white", s=14, marker="_", linewidths=1.4,
+                zorder=5,
+            )
+            sc.set_path_effects([
+                path_effects.Stroke(linewidth=2.6, foreground="black"),
+                path_effects.Normal(),
+            ])
+
+    proj_series = plot_df[project_col].astype(str)
+    project_centres = {}
+    for proj in proj_series.unique():
+        positions = np.arange(n)[(proj_series == proj).values]
+        if positions.size:
+            project_centres[proj] = float(positions.mean())
+    if project_centres:
+        ax.set_xticks(list(project_centres.values()))
+        ax.set_xticklabels(
+            [f"{xtick_prefix}{p}" for p in project_centres.keys()],
+            rotation=30, ha="right", fontsize=8,
+        )
+    ax.set_xlim(-0.5, n - 0.5)
+    ax.set_ylim(y_lo, y_hi)
+    ax.tick_params(axis="y", labelsize=8)
+
+    base_y = y_label or "value per household"
+    if column_name:
+        u = unit_for_column(column_name)
+        if u:
+            base_y = f"{base_y} ({u})"
+    ax.set_ylabel(base_y, fontsize=9)
+
+    base_title = title or (
+        f"{column_name} per household"
+        if column_name else "Per-household range bands"
+    )
+    if column_name:
+        u = unit_for_column(column_name)
+        if u and "(" not in base_title:
+            base_title = f"{base_title} ({u})"
+    if exclude_last_percentile:
+        base_title = f"{base_title}  (q1..q99 only)"
+    ax.set_title(base_title, fontsize=10)
+
+    # Discrete colourbar -- precise labels.
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    if exclude_last_percentile:
+        cbar = fig.colorbar(sm, ax=ax, fraction=0.04, pad=0.01, ticks=[2, 3])
+        cbar.set_ticklabels(["tail", "IQR"])
+    else:
+        cbar = fig.colorbar(sm, ax=ax, fraction=0.04, pad=0.01, ticks=[1, 2, 3])
+        cbar.set_ticklabels(["last percentile", "tail", "IQR"])
+    cbar.ax.tick_params(labelsize=8)
+
+    if save_fig_path:
+        fig.savefig(save_fig_path, dpi=150)
+        plt.close(fig)
+        return None
+    return fig
+
+
 def plot_load_duration_curve(
     df: pd.DataFrame,
     diff_column: str,
