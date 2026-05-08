@@ -8,7 +8,143 @@ import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 
+from etdmap.data_model import load_unit_map
+
 from . import analysis_helpers
+
+# ---------------------------------------------------------------------------
+# Unit registry — single source of truth for variable units across plots.
+# Loaded once at module import from etdmap/data/thresholds.csv.
+# ---------------------------------------------------------------------------
+
+_UNIT_MAP = load_unit_map()
+
+
+def unit_for_column(col: str) -> str:
+    """
+    Return the unit string for a known model column, '' otherwise.
+
+    Handles Diff variants (which inherit unit from parent) because
+    thresholds.csv lists them explicitly.
+    """
+    return _UNIT_MAP.get(col, "")
+
+
+def axis_label_with_unit(col: str, base_label: Optional[str] = None) -> str:
+    """
+    Build a unit-suffixed axis label for a column.
+
+    Examples
+    --------
+    >>> axis_label_with_unit("ElektriciteitNetgebruikHoog", "median value")
+    'median value (kWh)'
+    >>> axis_label_with_unit("UnknownColumn", "median value")
+    'median value'
+    """
+    base = base_label if base_label is not None else col
+    u = unit_for_column(col)
+    return f"{base} ({u})" if u else base
+
+
+# ---------------------------------------------------------------------------
+# Bimodal y-axis split detector — generalises the "two clusters of projects
+# with very different value ranges" pattern that squashes shared-axis boxplots.
+# ---------------------------------------------------------------------------
+
+# Heuristic constants -- kept at module scope so a future tuning pass is one edit.
+_RANGE_CLUSTER_MIN_GROUPS = 2        # need at least N groups to consider a split
+_RANGE_CLUSTER_MIN_VISIBLE_RATIO = 0.05  # a group's range / cluster y-axis must
+                                          # be at least this much; below this
+                                          # the group's box is visually cramped
+                                          # and belongs in its own cluster
+
+
+def detect_value_range_clusters(
+    per_group_min: pd.Series,
+    per_group_max: pd.Series,
+) -> list:
+    """
+    Split groups into N clusters so that no group's value range is
+    visually cramped inside its cluster's y-axis span.
+
+    Each group has a range [min, max]. A cluster's y-axis span is the
+    union of its members' ranges, i.e. (max of maxes) - (min of mins).
+    A group is "cramped" within a cluster when its own range
+    (group.max - group.min) is a tiny fraction (< MIN_VISIBLE_RATIO)
+    of the cluster's y-axis span: visually its box would be flattened
+    against either edge of the chart and unreadable.
+
+    Algorithm:
+      1. Sort groups by max ascending.
+      2. Walk through. Maintain the current cluster's (cluster_min,
+         cluster_max). For each new group, tentatively add it and
+         check whether ANY group in the resulting cluster (existing
+         members or the new arrival) would be visually cramped.
+      3. If yes, finalise the current cluster and start a new one
+         with the new group. If no, accept it.
+
+    This frames cluster boundaries entirely in visual terms. Both
+    extreme high outliers (their inclusion blows out the y-axis and
+    cramps everyone else) AND extreme low / very negative outliers
+    (symmetric: they push the cluster_min far below) trigger
+    splits the same way.
+
+    Returns
+    -------
+    list[set]
+        Cluster key sets, ordered by ascending cluster max value.
+        Length 1 when no meaningful split. Length N >= 2 when the
+        data has N visibly separate value ranges.
+    """
+    common = per_group_min.dropna().index.intersection(per_group_max.dropna().index)
+    if len(common) == 0:
+        return []
+    if len(common) < _RANGE_CLUSTER_MIN_GROUPS:
+        return [set(common)]
+
+    mins = per_group_min.loc[common].astype(float)
+    maxs = per_group_max.loc[common].astype(float)
+
+    sorted_keys = list(maxs.sort_values().index)
+    ranges = {k: float(maxs[k]) - float(mins[k]) for k in sorted_keys}
+
+    def _any_cramped(member_keys, span: float) -> bool:
+        if span <= 0:
+            return False  # all members are at the same point; nothing cramped
+        for k in member_keys:
+            if ranges[k] / span < _RANGE_CLUSTER_MIN_VISIBLE_RATIO:
+                return True
+        return False
+
+    clusters = []
+    current = []
+    cur_min = None
+    cur_max = None
+    for key in sorted_keys:
+        kmin = float(mins[key])
+        kmax = float(maxs[key])
+        if not current:
+            current = [key]
+            cur_min = kmin
+            cur_max = kmax
+            continue
+        new_min = min(cur_min, kmin)
+        new_max = max(cur_max, kmax)
+        new_span = new_max - new_min
+        if _any_cramped(current + [key], new_span):
+            clusters.append(set(current))
+            current = [key]
+            cur_min = kmin
+            cur_max = kmax
+        else:
+            current.append(key)
+            cur_min = new_min
+            cur_max = new_max
+    if current:
+        clusters.append(set(current))
+
+    return clusters
+
 
 # def plot_simple_vars_time(df, plot_var, title=None, plot_var_name=None, project_id=None, save_fig_path=None)
 
@@ -709,67 +845,30 @@ def plot_monthly_profile(
         return fig
 
 
-def plot_boxwhisker_comparison(
-        df: pd.DataFrame,
+def _draw_boxes(
+        ax,
+        plot_df: pd.DataFrame,
         value_col: str,
         x_group: str,
         color_group: str,
-        title: Optional[str] = None,
-        y_label: Optional[str] = None,
-        jitter_seed: int = 42,
-        save_fig_path: Optional[str] = None,
-) -> Optional[plt.Figure]:
+        x_cats: list,
+        c_cats: list,
+        c_colors: dict,
+        rng: np.random.Generator,
+        outlier_ids: Optional[set],
+        id_col: str,
+        xtick_prefix: str = "",
+) -> None:
     """
-    Box-and-whisker plot with jittered scatter overlay for distribution comparison.
+    Internal: draw boxes plus per-row scatter on a single axes. Used by
+    plot_boxwhisker_comparison for both single-axis and split-axis paths.
 
-    Designed for two standard views (ADR-005):
-      1. x=ProjectIdBSV, color=WoningType  → cross-project distribution
-      2. x=WoningType, color=ProjectIdBSV  → housing-type distribution
-
-    Each x-category gets one box (IQR + whiskers, no outlier markers). Individual
-    data points are overlaid as jittered dots coloured by color_group, so both the
-    within-group spread and the cross-group colour pattern are visible simultaneously.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        One row per observation unit (e.g. per household), with at least value_col,
-        x_group, and color_group columns.
-    value_col : str
-        Numeric column to plot on the y-axis (e.g. 'mean', 'COP_system').
-    x_group : str
-        Categorical column for x-axis positioning (e.g. 'ProjectIdBSV').
-    color_group : str
-        Categorical column for dot colour coding (e.g. 'WoningType').
-    title : str, optional
-        Plot title.
-    y_label : str, optional
-        Y-axis label. Defaults to value_col.
-    jitter_seed : int, optional
-        RNG seed for reproducible horizontal jitter. Default 42.
-    save_fig_path : str, optional
-        File path to save the figure. If None, the figure is returned.
-
-    Returns
-    -------
-    matplotlib.figure.Figure or None
+    When outlier_ids is given, only rows whose id_col value is in the set are
+    overlaid as 'x' markers. Otherwise the whole population is jittered as
+    coloured dots (the original behaviour).
     """
-    plot_df = df[[value_col, x_group, color_group]].dropna()
-    if plot_df.empty:
-        return None
-
-    x_cats = sorted(plot_df[x_group].dropna().unique().tolist(), key=str)
-    c_cats = sorted(plot_df[color_group].dropna().unique().tolist(), key=str)
     x_pos = {cat: i for i, cat in enumerate(x_cats)}
 
-    cmap = matplotlib.colormaps.get_cmap("tab10")
-    c_colors = {cat: cmap(i % 10) for i, cat in enumerate(c_cats)}
-
-    rng = np.random.default_rng(jitter_seed)
-    fig_width = max(8.0, len(x_cats) * 1.6 + 2.0)
-    fig, ax = plt.subplots(figsize=(fig_width, 6))
-
-    # Boxes (grey fill, no outlier markers — the scatter handles those)
     box_data = [
         plot_df[plot_df[x_group] == cat][value_col].dropna().values
         for cat in x_cats
@@ -786,45 +885,218 @@ def plot_boxwhisker_comparison(
         capprops=dict(linewidth=1.0, color="grey"),
     )
 
-    # Jittered scatter coloured by color_group
     legend_added = set()
-    for c_cat in c_cats:
-        c_df = plot_df[plot_df[color_group] == c_cat]
-        for x_cat in x_cats:
-            vals = c_df[c_df[x_group] == x_cat][value_col].dropna().values
-            if len(vals) == 0:
-                continue
-            jitter = rng.uniform(-0.22, 0.22, len(vals))
-            label = str(c_cat) if c_cat not in legend_added else "_nolegend_"
-            if c_cat not in legend_added:
-                legend_added.add(c_cat)
-            ax.scatter(
-                x_pos[x_cat] + jitter,
-                vals,
-                color=c_colors[c_cat],
-                alpha=0.65,
-                s=22,
-                linewidths=0,
-                label=label,
-                zorder=3,
-            )
+    if outlier_ids is not None and id_col in plot_df.columns:
+        # Outlier-only overlay: 'x' markers, no whole-population scatter.
+        ids = set(outlier_ids)
+        outlier_df = plot_df[plot_df[id_col].isin(ids)]
+        for c_cat in c_cats:
+            c_df = outlier_df[outlier_df[color_group] == c_cat]
+            for x_cat in x_cats:
+                vals = c_df[c_df[x_group] == x_cat][value_col].dropna().values
+                if len(vals) == 0:
+                    continue
+                jitter = rng.uniform(-0.18, 0.18, len(vals))
+                label = str(c_cat) if c_cat not in legend_added else "_nolegend_"
+                if c_cat not in legend_added:
+                    legend_added.add(c_cat)
+                ax.scatter(
+                    x_pos[x_cat] + jitter, vals,
+                    color=c_colors[c_cat],
+                    marker="x", s=60, linewidths=1.5, alpha=0.9, zorder=5,
+                    label=label,
+                )
+    else:
+        for c_cat in c_cats:
+            c_df = plot_df[plot_df[color_group] == c_cat]
+            for x_cat in x_cats:
+                vals = c_df[c_df[x_group] == x_cat][value_col].dropna().values
+                if len(vals) == 0:
+                    continue
+                jitter = rng.uniform(-0.22, 0.22, len(vals))
+                label = str(c_cat) if c_cat not in legend_added else "_nolegend_"
+                if c_cat not in legend_added:
+                    legend_added.add(c_cat)
+                ax.scatter(
+                    x_pos[x_cat] + jitter, vals,
+                    color=c_colors[c_cat],
+                    alpha=0.65, s=22, linewidths=0,
+                    label=label, zorder=3,
+                )
 
     ax.set_xticks(range(len(x_cats)))
-    ax.set_xticklabels([str(c) for c in x_cats], rotation=30, ha="right")
-    ax.set_ylabel(y_label or value_col)
-    ax.legend(
-        title=color_group,
-        bbox_to_anchor=(1.01, 1),
-        loc="upper left",
-        borderaxespad=0,
-        fontsize=9,
+    ax.set_xticklabels(
+        [f"{xtick_prefix}{c}" for c in x_cats], rotation=30, ha="right",
     )
-    plt.title(title or f"{value_col} by {x_group}")
-    plt.grid(True, axis="y", alpha=0.3)
-    plt.tight_layout()
+    ax.grid(True, axis="y", alpha=0.3)
+
+
+def plot_boxwhisker_comparison(
+        df: pd.DataFrame,
+        value_col: str,
+        x_group: str,
+        color_group: str,
+        *,
+        title: Optional[str] = None,
+        y_label: Optional[str] = None,
+        jitter_seed: int = 42,
+        save_fig_path: Optional[str] = None,
+        # Optional extensions: unit-aware labels, outlier overlay,
+        # and a stacked secondary axis. All default-None / default-empty
+        # so existing callers see no behaviour change.
+        column_name: Optional[str] = None,
+        outlier_ids: Optional[set] = None,
+        id_col: str = "HuisIdBSV",
+        secondary_axis_data: Optional[pd.DataFrame] = None,
+        secondary_axis_label: Optional[str] = None,
+        secondary_axis_value_col: Optional[str] = None,
+        xtick_prefix: str = "",
+) -> Optional[plt.Figure]:
+    """
+    Box-and-whisker plot with jittered scatter overlay for distribution
+    comparison. Produces a single figure (one PNG per call).
+
+    Designed for two standard views (ADR-005):
+      1. x=ProjectIdBSV, color=WoningType  -> cross-project distribution
+      2. x=WoningType, color=ProjectIdBSV  -> housing-type distribution
+
+    Each x-category gets one box (IQR + whiskers, no outlier markers).
+    Individual data points are overlaid as jittered dots coloured by
+    color_group, or, when ``outlier_ids`` is given, only those ids
+    appear as 'x' markers (used when a separate outlier table is
+    rendered alongside).
+
+    When ``secondary_axis_data`` is provided, the figure becomes a
+    2-row stacked subplot sharing the x-axis: boxplot on top
+    (height ratio 3), companion-metric scatter beneath
+    (height ratio 1) with its own y-axis label. This is the
+    layout used by the mapping report to show validate-fail-rate
+    next to the value distribution.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        One row per observation unit (e.g. per household), with at
+        least value_col, x_group, and color_group columns.
+    value_col : str
+        Numeric column to plot on the y-axis of the main subplot.
+    x_group : str
+        Categorical column for x-axis positioning (e.g. 'ProjectIdBSV').
+    color_group : str
+        Categorical column for dot colour coding.
+    title, y_label, jitter_seed, save_fig_path :
+        As before.
+    column_name : str, optional
+        ETD model column name. When given, the y_label and title are
+        suffixed with the variable's unit looked up from etdmap
+        thresholds (e.g. ' (kWh)'). Skipped silently if no unit is
+        registered.
+    outlier_ids : set, optional
+        If given, the whole-population scatter is replaced with 'x'
+        markers showing only the rows whose id_col value is in this
+        set.
+    id_col : str, optional
+        Column holding the id used by outlier_ids. Default 'HuisIdBSV'.
+    secondary_axis_data : pd.DataFrame, optional
+        Extra per-row data plotted as grey triangles on a *separate
+        stacked subplot* below the main plot (NOT a twinx() overlay).
+        Must contain x_group and the column named by
+        secondary_axis_value_col.
+    secondary_axis_label : str, optional
+        Y-axis label for the secondary subplot.
+    secondary_axis_value_col : str, optional
+        Column in secondary_axis_data holding the secondary-axis values.
+
+    Returns
+    -------
+    matplotlib.figure.Figure or None
+    """
+    select_cols = list(dict.fromkeys([value_col, x_group, color_group]))
+    if outlier_ids is not None and id_col in df.columns and id_col not in select_cols:
+        select_cols = select_cols + [id_col]
+    plot_df = df[[c for c in select_cols if c in df.columns]].dropna(subset=[value_col])
+    if plot_df.empty:
+        return None
+
+    x_cats = sorted(plot_df[x_group].dropna().unique().tolist(), key=str)
+    c_cats = sorted(plot_df[color_group].dropna().unique().tolist(), key=str)
+
+    cmap = matplotlib.colormaps.get_cmap("tab10")
+    c_colors = {cat: cmap(i % 10) for i, cat in enumerate(c_cats)}
+    rng = np.random.default_rng(jitter_seed)
+
+    # Resolve labels with optional unit lookup
+    effective_y = y_label or value_col
+    effective_title = title or f"{value_col} by {x_group}"
+    if column_name:
+        u = unit_for_column(column_name)
+        if u:
+            effective_y = f"{effective_y} ({u})"
+            effective_title = f"{effective_title} ({u})"
+
+    fig_width = max(8.0, len(x_cats) * 1.6 + 2.0)
+    has_secondary = (
+        secondary_axis_data is not None
+        and secondary_axis_value_col is not None
+        and not secondary_axis_data.empty
+    )
+
+    if has_secondary:
+        # 2-row stacked subplot. Top = boxplot. Bottom = companion-metric
+        # scatter on its own y-axis. Sharex keeps the project labels
+        # aligned across both. height_ratios=[3, 1] keeps the boxplot
+        # dominant.
+        fig, (ax, ax2) = plt.subplots(
+            2, 1, figsize=(fig_width, 7),
+            sharex=True, gridspec_kw={"height_ratios": [3, 1]},
+            constrained_layout=True,
+        )
+    else:
+        fig, ax = plt.subplots(
+            figsize=(fig_width, 6), constrained_layout=True,
+        )
+        ax2 = None
+
+    _draw_boxes(
+        ax, plot_df, value_col, x_group, color_group,
+        x_cats, c_cats, c_colors, rng, outlier_ids, id_col,
+        xtick_prefix=xtick_prefix,
+    )
+    ax.set_ylabel(effective_y)
+    ax.legend(
+        title=color_group, bbox_to_anchor=(1.01, 1), loc="upper left",
+        borderaxespad=0, fontsize=9,
+    )
+    ax.set_title(effective_title)
+
+    if ax2 is not None:
+        # Companion-metric scatter beneath. Hide redundant tick labels on
+        # the boxplot (they show on the scatter row).
+        plt.setp(ax.get_xticklabels(), visible=False)
+        for x_cat in x_cats:
+            grp = secondary_axis_data[
+                secondary_axis_data[x_group].astype(str) == str(x_cat)
+            ]
+            vals = pd.to_numeric(
+                grp.get(secondary_axis_value_col, pd.Series(dtype=float)),
+                errors="coerce",
+            ).dropna()
+            if len(vals) > 0:
+                ax2.scatter(
+                    [x_cats.index(x_cat)] * len(vals), vals.values,
+                    color="grey", marker="^", s=18, alpha=0.6, zorder=2,
+                )
+        ax2.set_xticks(range(len(x_cats)))
+        ax2.set_xticklabels(
+            [f"{xtick_prefix}{c}" for c in x_cats], rotation=30, ha="right",
+        )
+        if secondary_axis_label:
+            ax2.set_ylabel(secondary_axis_label, fontsize=9)
+        ax2.set_ylim(0, 1.1)
+        ax2.grid(True, axis="y", alpha=0.3)
 
     if save_fig_path:
-        fig.savefig(save_fig_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save_fig_path, dpi=150)
         plt.close(fig)
     else:
         return fig
@@ -836,7 +1108,8 @@ def plot_load_duration_curve(
     interval: str,
     project_id: Optional[int|str]=None,
     save_fig_path: Optional[str]=None,
-    filter_upper_lower_bounds: bool=True
+    filter_upper_lower_bounds: bool=True,
+    outlier_marks: Optional[list]=None,
 ) -> None:
     """
     Plot the load duration curve for a given variable.
@@ -854,6 +1127,13 @@ def plot_load_duration_curve(
     save_fig_path : str, optional
         File path to save the plot. If provided, the plot will be saved to this path.
         If not provided, the function returns the figure object.
+    filter_upper_lower_bounds : bool, optional
+        If True, pre-filter via analysis_helpers.filter_between_upper_lower_bounds.
+        Default True.
+    outlier_marks : list of int, optional
+        X positions (1-based, in the sorted-curve coordinate space) at which
+        to draw red dashed vertical reference lines. Use this to highlight
+        positions where outliers were filtered out. Default None.
 
     Returns
     -------
@@ -878,7 +1158,7 @@ def plot_load_duration_curve(
     y_data = sorted_values * multiplier
 
     # Plot
-    fig, ax = plt.subplots(figsize=(16, 12))
+    fig, ax = plt.subplots(figsize=(16, 12), constrained_layout=True)
 
     # Determine label for line
     if project_id is not None:
@@ -887,12 +1167,15 @@ def plot_load_duration_curve(
         label = f"{diff_column}"
     ax.plot(x_data, y_data, marker="none", label=label)
 
-    plt.title(f"Load Duration Curve ({interval}): {diff_column.replace('Diff', 'Netto')}")
+    if outlier_marks:
+        for x_pos in outlier_marks:
+            ax.axvline(x=x_pos, color="r", linestyle="--", alpha=0.6, linewidth=0.8)
+
+    ax.set_title(f"Load Duration Curve ({interval}): {diff_column.replace('Diff', 'Netto')}")
     ax.set_xlabel("Time (1 year)")
-    ax.set_ylabel("Power (kW)")
+    ax.set_ylabel(axis_label_with_unit(diff_column, "Power"))
     ax.legend()
-    plt.grid(True)
-    plt.tight_layout()
+    ax.grid(True)
 
     # Some statistics
     threshold = 1.5

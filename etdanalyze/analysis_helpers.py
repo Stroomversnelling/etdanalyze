@@ -2,9 +2,251 @@ import re
 from typing import Optional
 
 import etdtransform
+import numpy as np
 import pandas as pd
 from ibis import _
 from ibis.expr.types import Table
+
+
+def sort_load(series: pd.Series) -> pd.Series:
+    """
+    Sort a Series in descending order and reset the index.
+
+    Used by load-duration-curve plots: the result is the y-axis values when
+    plotted against ascending integer positions on the x-axis.
+
+    Parameters
+    ----------
+    series : pd.Series
+        Numeric series to sort.
+
+    Returns
+    -------
+    pd.Series
+        Descending-sorted values with a fresh RangeIndex.
+    """
+    return series.sort_values(ascending=False).reset_index(drop=True)
+
+
+def _outlier_mask_tukey(series: pd.Series, k: float = 1.5, z_thresh: float = 2.5) -> pd.Series:
+    """
+    Boolean mask of outliers via Tukey fence (Q1 - k*IQR, Q3 + k*IQR), with
+    a z-score fallback for tiny samples (n < 4) or zero IQR. Index-aligned
+    with the input.
+    """
+    s = pd.to_numeric(series, errors="coerce")
+    n = s.notna().sum()
+    if n < 1:
+        return pd.Series(False, index=series.index)
+    if n < 4:
+        # z-score fallback: too few points for IQR to be meaningful
+        std = s.std(ddof=0)
+        if std == 0 or pd.isna(std):
+            return pd.Series(False, index=series.index)
+        z = (s - s.mean()).abs() / std
+        return (z > z_thresh).fillna(False)
+    q1, q3 = s.quantile(0.25), s.quantile(0.75)
+    iqr = q3 - q1
+    if iqr == 0:
+        std = s.std(ddof=0)
+        if std == 0 or pd.isna(std):
+            return pd.Series(False, index=series.index)
+        z = (s - s.mean()).abs() / std
+        return (z > z_thresh).fillna(False)
+    lo, hi = q1 - k * iqr, q3 + k * iqr
+    return ((s < lo) | (s > hi)).fillna(False)
+
+
+def _percentile_bounds(series: pd.Series) -> tuple:
+    """
+    Compute (low_bound, high_bound) using the q01*10 / q99*10 rule from
+    `filter_between_upper_lower_bounds`. The low bound is 0 unless the
+    1st-percentile value is itself negative (in which case it is q01*10).
+    Captures legitimate large tails while clipping extreme values that
+    dwarf the bulk of the data.
+    """
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return None, None
+    high_bound = float(s.quantile(0.99) * 10)
+    if float(s.min()) < 0 and float(s.quantile(0.01)) < 0:
+        low_bound = float(s.quantile(0.01) * 10)
+    else:
+        low_bound = 0.0
+    return low_bound, high_bound
+
+
+def build_extreme_value_table(
+        df: pd.DataFrame,
+        value_col: str,
+        *,
+        group_cols: tuple = ("Dataleverancier", "ProjectIdBSV"),
+        id_col: str = "HuisIdBSV",
+        top_n: int = 10,
+) -> pd.DataFrame:
+    """
+    Long-form table of rows whose `value_col` falls outside the
+    percentile-bounds (q01*10 / q99*10) of its (group_cols) cohort.
+
+    Sibling of `build_outlier_table`. The two answer different questions:
+
+    - `build_outlier_table` (Tukey + z-score): "is this value unusual
+      relative to its cohort distribution?" Sensitive to relative
+      position. Best for spotting per-project anomalies where the
+      cohort has a reasonably symmetric spread.
+    - `build_extreme_value_table` (this function, percentile-bounds):
+      "is this value so extreme that it dwarfs the bulk of the data?"
+      Robust to skewed distributions (energy variables typically are).
+      Insensitive to non-normality.
+
+    The two are not interchangeable. Pick the one that matches the
+    question you are asking.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        One row per observation; must include value_col, id_col, and
+        every column in group_cols.
+    value_col : str
+        Numeric column to scan.
+    group_cols : tuple of str, optional
+        Cohort definition. Default ('Dataleverancier', 'ProjectIdBSV').
+    id_col : str, optional
+        Identifier column for each observation. Default 'HuisIdBSV'.
+    top_n : int, optional
+        Maximum number of rows in the result (sorted by absolute
+        distance from the violated bound, descending).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: id_col, *group_cols, value, bound_low, bound_high,
+        direction ('above' or 'below'). Empty when no row is extreme.
+    """
+    needed = list(dict.fromkeys([id_col, *group_cols, value_col]))
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise KeyError(f"build_extreme_value_table: missing columns {missing}")
+    work = df[needed].copy()
+    work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+    work = work.dropna(subset=[value_col])
+    if work.empty:
+        return pd.DataFrame(
+            columns=[id_col, *group_cols, "value", "bound_low", "bound_high", "direction"]
+        )
+
+    rows = []
+    for keys, sub in work.groupby(list(group_cols), dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        low_bound, high_bound = _percentile_bounds(sub[value_col])
+        if low_bound is None:
+            continue
+        s = sub[value_col]
+        above = sub.index[s > high_bound]
+        below = sub.index[s < low_bound]
+        for idx in above:
+            row = {id_col: sub.loc[idx, id_col]}
+            for gcol, gval in zip(group_cols, keys):
+                row[gcol] = gval
+            row["value"] = float(s.loc[idx])
+            row["bound_low"] = float(low_bound)
+            row["bound_high"] = float(high_bound)
+            row["direction"] = "above"
+            row["_distance"] = float(s.loc[idx]) - float(high_bound)
+            rows.append(row)
+        for idx in below:
+            row = {id_col: sub.loc[idx, id_col]}
+            for gcol, gval in zip(group_cols, keys):
+                row[gcol] = gval
+            row["value"] = float(s.loc[idx])
+            row["bound_low"] = float(low_bound)
+            row["bound_high"] = float(high_bound)
+            row["direction"] = "below"
+            row["_distance"] = float(low_bound) - float(s.loc[idx])
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[id_col, *group_cols, "value", "bound_low", "bound_high", "direction"]
+        )
+    out = pd.DataFrame(rows).sort_values("_distance", ascending=False).drop(columns="_distance")
+    return out.head(top_n).reset_index(drop=True)
+
+
+def build_outlier_table(
+        df: pd.DataFrame,
+        value_col: str,
+        *,
+        group_cols: tuple = ("Dataleverancier", "ProjectIdBSV"),
+        id_col: str = "HuisIdBSV",
+        top_n: int = 10,
+) -> pd.DataFrame:
+    """
+    Long-form table of rows whose value_col is an outlier within its
+    (group_cols) cohort.
+
+    Outlier detection: Tukey fence (Q1 - 1.5*IQR, Q3 + 1.5*IQR) with z-score
+    fallback for tiny groups and zero-IQR cases. Columns in the result:
+    id_col, *group_cols, value, group_median, z_score. Sorted by
+    abs(z_score) descending. Capped at top_n rows; the caller is
+    responsible for noting truncation.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        One row per observation; must include value_col, id_col, and
+        every column in group_cols (extras are ignored).
+    value_col : str
+        Numeric column to scan for outliers.
+    group_cols : tuple of str, optional
+        Cohort definition. Default ('Dataleverancier', 'ProjectIdBSV').
+    id_col : str, optional
+        Identifier column for each observation. Default 'HuisIdBSV'.
+    top_n : int, optional
+        Maximum number of rows in the result. Default 10.
+
+    Returns
+    -------
+    pd.DataFrame
+        Empty if no outliers are found.
+    """
+    needed = list(dict.fromkeys([id_col, *group_cols, value_col]))
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise KeyError(f"build_outlier_table: missing columns {missing}")
+    work = df[needed].copy()
+    work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+    work = work.dropna(subset=[value_col])
+    if work.empty:
+        return pd.DataFrame(columns=[id_col, *group_cols, "value", "group_median", "z_score"])
+
+    rows = []
+    for keys, sub in work.groupby(list(group_cols), dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        s = sub[value_col]
+        mask = _outlier_mask_tukey(s)
+        if not mask.any():
+            continue
+        med = s.median()
+        std = s.std(ddof=0)
+        for idx in sub.index[mask]:
+            v = float(s.loc[idx])
+            z = float(abs(v - med) / std) if std and not pd.isna(std) else float("inf")
+            row = {id_col: sub.loc[idx, id_col]}
+            for gcol, gval in zip(group_cols, keys):
+                row[gcol] = gval
+            row["value"] = v
+            row["group_median"] = float(med) if not pd.isna(med) else None
+            row["z_score"] = z
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=[id_col, *group_cols, "value", "group_median", "z_score"])
+    out = pd.DataFrame(rows)
+    out = out.sort_values("z_score", ascending=False, key=lambda s: s.abs())
+    return out.head(top_n).reset_index(drop=True)
 
 
 def aggregate_project_metrics(hh_table, project_table, col_list):
