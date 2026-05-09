@@ -200,14 +200,14 @@ class TestBuildOutlierTable:
 class TestBuildExtremeValueTable:
     """The percentile-bounds approach answers a different question than
     Tukey: 'is this value so extreme it dwarfs the bulk of the data?',
-    independent of distribution shape. The q99*10 / q01*10 thresholds
+    independent of distribution shape. The p99*10 / p01*10 thresholds
     are designed for sufficiently large samples (typically per-row
-    time-series with hundreds of records per project), where q99 is
+    time-series with hundreds of records per project), where p99 is
     substantially less than the extreme tail values."""
 
     def _frame_with_extreme_high(self, n_normal=200):
         # Bulk around 100 (n_normal rows); one value 1000x larger that
-        # comfortably exceeds q99 * 10.
+        # comfortably exceeds p99 * 10.
         rng = np.random.default_rng(0)
         rows = [
             {"HuisIdBSV": i + 1, "Dataleverancier": "A", "ProjectIdBSV": 1,
@@ -236,7 +236,7 @@ class TestBuildExtremeValueTable:
             assert c in out.columns
 
     def test_finds_below_low_bound_when_negative(self):
-        # When q01 is negative, bound_low becomes q01*10. A value far
+        # When p01 is negative, bound_low becomes p01*10. A value far
         # below that bound should be flagged 'below'.
         rng = np.random.default_rng(0)
         rows = [
@@ -350,7 +350,7 @@ class TestBoxwhiskerExtensions:
 
 class TestPlotHouseholdRangeStrips:
     """The new helper draws one vertical range strip per household with
-    min-q1-q25-median-q75-q99-max marks, grouped by project. Smoke tests
+    min-p25-q25-median-q75-p99-max marks, grouped by project. Smoke tests
     cover the happy path and column-validation."""
 
     def _frame(self, n_per_project=4):
@@ -364,11 +364,11 @@ class TestPlotHouseholdRangeStrips:
                     "ProjectIdBSV": proj,
                     "Dataleverancier": "Watch-E" if proj > 1 else "Factory Zero",
                     "min": float(base + rng.normal(0, 0.1)),
-                    "quantile_1": float(base + 0.5),
-                    "quantile_25": float(base + 1.0),
+                    "p01": float(base + 0.5),
+                    "p25": float(base + 1.0),
                     "median": float(base + 1.5),
-                    "quantile_75": float(base + 2.0),
-                    "quantile_99": float(base + 2.5),
+                    "p75": float(base + 2.0),
+                    "p99": float(base + 2.5),
                     "max": float(base + 3.0 + rng.uniform(0, 1)),
                 })
         return pd.DataFrame(rows)
@@ -409,7 +409,7 @@ class TestPlotHouseholdRangeStrips:
             plot_household_range_strips(df)
 
     def test_missing_optional_percentile_columns_silently_drops_segments(self, tmp_path):
-        # min/median/max only -- no q1/q25/q75/q99. Should still render.
+        # min/median/max only -- no p25/q25/q75/p99. Should still render.
         df = pd.DataFrame({
             "HuisIdBSV":       ["A", "B", "C"],
             "ProjectIdBSV":    [1, 1, 2],

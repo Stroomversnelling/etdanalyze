@@ -45,23 +45,23 @@ def _outlier_mask_tukey(series: pd.Series, k: float = 1.5, z_thresh: float = 2.5
             return pd.Series(False, index=series.index)
         z = (s - s.mean()).abs() / std
         return (z > z_thresh).fillna(False)
-    q1, q3 = s.quantile(0.25), s.quantile(0.75)
-    iqr = q3 - q1
+    p25, p75 = s.quantile(0.25), s.quantile(0.75)
+    iqr = p75 - p25
     if iqr == 0:
         std = s.std(ddof=0)
         if std == 0 or pd.isna(std):
             return pd.Series(False, index=series.index)
         z = (s - s.mean()).abs() / std
         return (z > z_thresh).fillna(False)
-    lo, hi = q1 - k * iqr, q3 + k * iqr
+    lo, hi = p25 - k * iqr, p75 + k * iqr
     return ((s < lo) | (s > hi)).fillna(False)
 
 
 def _percentile_bounds(series: pd.Series) -> tuple:
     """
-    Compute (low_bound, high_bound) using the q01*10 / q99*10 rule from
+    Compute (low_bound, high_bound) using the p01*10 / p99*10 rule from
     `filter_between_upper_lower_bounds`. The low bound is 0 unless the
-    1st-percentile value is itself negative (in which case it is q01*10).
+    1st-percentile value is itself negative (in which case it is p01*10).
     Captures legitimate large tails while clipping extreme values that
     dwarf the bulk of the data.
     """
@@ -86,7 +86,7 @@ def build_extreme_value_table(
 ) -> pd.DataFrame:
     """
     Long-form table of rows whose `value_col` falls outside the
-    percentile-bounds (q01*10 / q99*10) of its (group_cols) cohort.
+    percentile-bounds (p01*10 / p99*10) of its (group_cols) cohort.
 
     Sibling of `build_outlier_table`. The two answer different questions:
 
@@ -601,15 +601,20 @@ def calculate_ventilatievoud(
 # ---------------------------------------------------------------------------
 
 _COP_HEAT_COLS = {
-    "system":  "WarmteproductieWarmtepomp",
-    "hp_only": "WarmteproductieWarmtepomp",
-    "heating": "WarmteproductieRuimteverwarming",
-    "dhw":     "WarmteproductieWarmTapwater",
+    "system":  "WarmteproductieWarmtepompDiff",
+    "hp_only": "WarmteproductieWarmtepompDiff",
+    "heating": "WarmteproductieRuimteverwarmingDiff",
+    "dhw":     "WarmteproductieWarmTapwaterDiff",
 }
+# Electricity columns: ElektriciteitsgebruikTotaalWarmtepomp has
+# resample_method=sum so its non-Diff name in the 60min parquet is
+# already per-hour delta in kWh (no Diff suffix in the catalog).
+# ElektriciteitsgebruikBoilervat (no suffix) is a cumulative meter --
+# use the *Diff variant for the per-hour delta.
 _COP_ELEC_COLS = {
     "system":  ("ElektriciteitsgebruikTotaalWarmtepomp", None),
-    "hp_only": ("ElektriciteitsgebruikTotaalWarmtepomp", "ElektriciteitsgebruikBoilervat"),
-    "heating": ("ElektriciteitsgebruikTotaalWarmtepomp", "ElektriciteitsgebruikBoilervat"),
+    "hp_only": ("ElektriciteitsgebruikTotaalWarmtepomp", "ElektriciteitsgebruikBoilervatDiff"),
+    "heating": ("ElektriciteitsgebruikTotaalWarmtepomp", "ElektriciteitsgebruikBoilervatDiff"),
     "dhw":     ("ElektriciteitsgebruikTotaalWarmtepomp", None),
 }
 _COP_MODE_FILTER = {
@@ -617,8 +622,8 @@ _COP_MODE_FILTER = {
     "dhw":     [1, 6],
 }
 _COP_PRODUCTION_GUARD = {
-    "heating": "WarmteproductieRuimteverwarming",
-    "dhw":     "WarmteproductieWarmTapwater",
+    "heating": "WarmteproductieRuimteverwarmingDiff",
+    "dhw":     "WarmteproductieWarmTapwaterDiff",
 }
 
 
@@ -714,23 +719,82 @@ def compute_stats_table(
         df: pd.DataFrame,
         group_cols: list,
         value_cols: list,
+        *,
+        interval: str = "60min",
+        period_days: int = 365,
+        aggregation_methods: dict | None = None,
 ) -> pd.DataFrame:
     """
     Descriptive stats for each value column grouped by group_cols.
 
     Returns long-format DataFrame: one row per (group keys x variable)
     with columns: variable, *group_cols, mean, median, std, min, max,
-    q1 (25th percentile), q3 (75th percentile), q01 (1st percentile),
-    q99 (99th percentile), count.
+    p25 (25th percentile), p75 (75th percentile), p01 (1st percentile),
+    p99 (99th percentile), count.
 
-    Note: ``q1`` and ``q3`` are the inter-quartile boundaries (25/75),
-    kept under those names for compatibility with existing analysis
-    scripts that already consume the column. ``q01`` and ``q99`` are
-    the extreme-tail percentiles, useful for distinguishing typical
-    extremes from single-record outliers in min/max.
+    Note: ``p25`` and ``p75`` are the inter-quartile boundaries (25/75);
+    ``p01`` and ``p99`` are the extreme-tail percentiles. Names match
+    the standardised set produced by
+    ``etdmap.mapping_helpers.compute_numeric_column_stats`` so consumers
+    of either function can use the same column references.
 
-    Columns not present in df are silently skipped.
+    For variables whose etdmodel ``ResamplingMethode`` is ``"sum"`` (i.e.
+    cumulative usage like kWh / liters), an extra ``period_total`` column
+    is added: the per-row mean scaled to the period's natural total via
+    ``etdanalyze.units.mean_per_row_to_period_total``. For ``"mean"`` /
+    ``"max"`` resampled variables (rates / states like degC / kW) no
+    period_total is added -- the per-row mean is already the right stat.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Source DataFrame, one row per ``interval``.
+    group_cols : list
+        Columns to group by (e.g. ``["ProjectIdBSV"]``).
+    value_cols : list
+        Variables to compute stats for. Columns not in ``df`` are silently
+        skipped.
+    interval : str, default ``"60min"``
+        Row interval, used to scale per-row means to period totals for
+        sum-resampled variables.
+    period_days : int, default 365
+        Days in the period being summarised. Pass 213 for
+        verwarmingsperiode (Oct-Apr), 152 for koelingsperiode (May-Sep),
+        etc. Caller filters df to the period before calling.
+    aggregation_methods : dict, optional
+        ``{var: resample_method}`` mapping to override the data-model
+        defaults. If None, pulled from
+        ``etdmap.data_model.get_aggregation_config()``. Variables absent
+        from both this map and the config default to ``"mean"`` (no
+        period_total is computed).
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-format stats; empty DataFrame if no value_cols match.
+
+    Notes
+    -----
+    This function operates on an in-memory DataFrame. The whole
+    filtered dataset must fit in RAM. Future-proofing: when datasets
+    outgrow RAM, the caller shards (typically by project) and concats
+    the per-shard stats; the schema (parent ADR-018) is preserved
+    across shards. See parent ADR-017 for the full sharding /
+    fallback ladder.
     """
+    if aggregation_methods is None:
+        try:
+            from etdmap.data_model import get_aggregation_config
+            cfg = get_aggregation_config()
+            aggregation_methods = {
+                var: cfg.get(var, {}).get("resample_method", "mean")
+                for var in value_cols
+            }
+        except Exception:
+            aggregation_methods = {}
+
+    from etdanalyze.units import mean_per_row_to_period_total
+
     results = []
     for col in value_cols:
         if col not in df.columns:
@@ -739,10 +803,154 @@ def compute_stats_table(
         stats = grp.agg(["mean", "median", "std", "min", "max", "size"]).reset_index()
         stats = stats.rename(columns={"size": "count"})
         q = grp.quantile([0.01, 0.25, 0.75, 0.99]).unstack(level=-1).reset_index()
-        q.columns = list(group_cols) + ["q01", "q1", "q3", "q99"]
+        q.columns = list(group_cols) + ["p01", "p25", "p75", "p99"]
         stats = stats.merge(q, on=group_cols, how="left")
+        # iqr is part of NUMERIC_STATS_SCHEMA (parent ADR-018); compute it
+        # here so the per-group output matches the per-Series kernel.
+        stats["iqr"] = stats["p75"] - stats["p25"]
         stats.insert(0, "variable", col)
+
+        method = aggregation_methods.get(col, "mean")
+        if method == "sum":
+            stats["period_total"] = stats["mean"].apply(
+                lambda m: (
+                    mean_per_row_to_period_total(
+                        float(m), interval, period_days=period_days
+                    )
+                    if pd.notna(m) else pd.NA
+                )
+            )
+
         results.append(stats)
+    return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+
+
+def compute_stats_table_lazy(
+        tbl,
+        group_cols: list,
+        value_cols: list,
+        *,
+        interval: str = "60min",
+        period_days: int = 365,
+        aggregation_methods: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Lazy ibis variant of :func:`compute_stats_table`.
+
+    Accepts an ibis Table (with any joins / filters / projections already
+    applied lazily) and pushes ``count``, ``mean``, ``std``, ``min``,
+    ``max``, ``median``, ``p01``, ``p25``, ``p75``, ``p99`` into a
+    DuckDB ``group_by().aggregate(...)``. Only the small per-group
+    result is executed back to pandas. ``iqr`` and (where applicable)
+    ``period_total`` are computed in pandas on the small result.
+
+    Output schema matches :func:`compute_stats_table` and the canonical
+    ``NUMERIC_STATS_SCHEMA`` (parent ADR-018) so the schema-parity test
+    holds across both paths.
+
+    Parameters
+    ----------
+    tbl : ibis.expr.types.Table
+        Lazy ibis expression with the data for stats. May include any
+        already-applied joins (``join_index_table``, ``join_weather_data``)
+        and filters (e.g. period months via predicate pushdown).
+    group_cols : list
+        Columns to group by.
+    value_cols : list
+        Variables to compute stats for. Columns absent from ``tbl`` are
+        silently skipped.
+    interval, period_days, aggregation_methods :
+        Same semantics as :func:`compute_stats_table`. ``period_total``
+        is added in pandas after the small result is executed.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-format stats; empty DataFrame if no value_cols match.
+
+    Notes
+    -----
+    Implementation is **batched**: one ``.execute()`` per call to this
+    function, carrying every column in ``value_cols`` in a single
+    ``aggregate(**{...})``. The upstream join chain is therefore
+    computed once per call, not once per variable, so the function
+    scales cleanly even on heavily-joined ibis tables (climate's
+    ``join_index_table -> join_weather_data`` chain).
+
+    See ``etdworkflow/docs/performance/lazy-join-strategies.md`` for
+    the per-col vs batched vs cached comparison on the real climate
+    workflow (batched is ~1.86x faster than per-col and matches the
+    hoist+pandas approach end-to-end).
+
+    Use this function when the caller has an ibis Table (with whatever
+    upstream joins / filters / projections already applied lazily) and
+    wants per-group stats without materialising the full DataFrame in
+    pandas memory. Stay with :func:`compute_stats_table` when the
+    caller already has a pandas DataFrame in hand (e.g. because a
+    later plot or Excel block needs it materialised regardless).
+    """
+    from etdanalyze.units import mean_per_row_to_period_total
+    if aggregation_methods is None:
+        try:
+            from etdmap.data_model import get_aggregation_config
+            cfg = get_aggregation_config()
+            aggregation_methods = {
+                var: cfg.get(var, {}).get("resample_method", "mean")
+                for var in value_cols
+            }
+        except Exception:
+            aggregation_methods = {}
+
+    available_cols = [c for c in value_cols if c in tbl.columns]
+    if not available_cols:
+        return pd.DataFrame()
+
+    # Batched aggregation: ALL variables in ONE .execute() so the upstream
+    # joins and the parquet scan are computed once per call instead of
+    # once per variable. On the climate workflow (3 vars per call, index +
+    # weather joins) this is ~1.9x faster than the per-variable version.
+    # See etdworkflow/docs/performance/lazy-join-strategies.md.
+    agg_exprs: dict = {}
+    for col in available_cols:
+        e = tbl[col]
+        agg_exprs[f"{col}__count"] = e.count()
+        agg_exprs[f"{col}__mean"] = e.mean()
+        agg_exprs[f"{col}__std"] = e.std()
+        agg_exprs[f"{col}__min"] = e.min()
+        agg_exprs[f"{col}__max"] = e.max()
+        agg_exprs[f"{col}__median"] = e.quantile(0.5)
+        agg_exprs[f"{col}__p01"] = e.quantile(0.01)
+        agg_exprs[f"{col}__p25"] = e.quantile(0.25)
+        agg_exprs[f"{col}__p75"] = e.quantile(0.75)
+        agg_exprs[f"{col}__p99"] = e.quantile(0.99)
+
+    wide = tbl.group_by(group_cols).aggregate(**agg_exprs).execute()
+
+    # Unpivot to long format. Drop groups with zero non-null observations
+    # per variable so output matches the per-column .drop_null([col]) path
+    # used by compute_stats_table.
+    results = []
+    for col in available_cols:
+        sub = wide[list(group_cols)].copy()
+        for stat in ("count", "mean", "std", "min", "max", "median",
+                     "p01", "p25", "p75", "p99"):
+            sub[stat] = wide[f"{col}__{stat}"]
+        sub["iqr"] = sub["p75"] - sub["p25"]
+        sub = sub[sub["count"].fillna(0) > 0].copy()
+        sub.insert(0, "variable", col)
+
+        method = aggregation_methods.get(col, "mean")
+        if method == "sum":
+            sub["period_total"] = sub["mean"].apply(
+                lambda m: (
+                    mean_per_row_to_period_total(
+                        float(m), interval, period_days=period_days
+                    )
+                    if pd.notna(m) else pd.NA
+                )
+            )
+
+        results.append(sub)
     return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
 
 

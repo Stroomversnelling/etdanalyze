@@ -211,6 +211,14 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
     """
     Plot seasonal data for a specific project, showing statistical ranges and mean values.
 
+    For ``*Diff`` columns (per-row energy in kWh-per-interval), the
+    interval is inferred from ``ReadingDate`` and the per-row values are
+    converted to average power (kW) before plotting -- a daily profile
+    is read most naturally in power units. The y-label reflects the
+    converted unit. For non-Diff columns the values are plotted as-is
+    and the y-label is built from etdmap unit metadata via
+    ``axis_label_with_unit``.
+
     Parameters
     ----------
     df : pd.DataFrame
@@ -220,7 +228,9 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
     title : str
         Optional. Title to be used in the plot. If not defined the plot_var_name or plot_var is used.
     plot_var_name : str
-        A descriptive name for the plot variable (for axis labeling).
+        A descriptive name for the plot variable (for axis labeling). When
+        omitted, the y-label is derived from etdmap unit metadata (with
+        the kW substitution for Diff columns described above).
     project_id: int|str:
         Optional: when provided the df is filtered to only contain data of that project.
     save_fig_path : str, optional
@@ -233,7 +243,28 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
     """
 
     # add time_of_day column that sets the times correctly.
-    df_normalized_dt = etdtransform.calculated_columns.add_normalized_datetime(df)
+    df_normalized_dt = etdtransform.calculated_columns.add_normalized_datetime(df).copy()
+
+    # For Diff columns, convert per-row energy (kWh per interval) to
+    # average power (kW) so the daily profile reads in the variable's
+    # natural rate unit. Non-Diff columns are plotted as-is.
+    converted_unit = None
+    if plot_var.endswith("Diff") and "ReadingDate" in df_normalized_dt.columns:
+        try:
+            from etdanalyze.units import (
+                infer_interval_from_readingdate,
+                convert_diff_to_power,
+            )
+            interval = infer_interval_from_readingdate(df_normalized_dt)
+            df_normalized_dt[plot_var] = convert_diff_to_power(
+                df_normalized_dt[plot_var], interval
+            )
+            converted_unit = "kW"
+        except Exception:
+            # If the interval can't be inferred or the conversion fails,
+            # fall through to plotting raw values; the y-label will
+            # reflect the unconverted data via axis_label_with_unit.
+            converted_unit = None
 
     grouped = df_normalized_dt.groupby(["ProjectIdBSV", "time_of_day"])[plot_var]
     stats = ["mean", "median", "min", "max"]
@@ -241,7 +272,7 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
 
     # Add quartiles (25th and 75th percentiles)
     quartiles = grouped.quantile([0.25, 0.75]).unstack(level=-1).reset_index()
-    quartiles.columns = ["ProjectIdBSV", "time_of_day", "q1", "q3"]
+    quartiles.columns = ["ProjectIdBSV", "time_of_day", "p25", "p75"]
     summary_df = summary_df.merge(quartiles, on=["ProjectIdBSV", "time_of_day"], how="left")
 
     # Filter for the specific project
@@ -250,12 +281,12 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
 
     # Set up plot colors for different statistics
     cmap = plt.colormaps.get_cmap("autumn")
-    stats_to_plot = ["min", "q1", "median", "q3", "max"]
+    stats_to_plot = ["min", "p25", "median", "p75", "max"]
     stat_colors = [cmap(i / (len(stats_to_plot) - 1) / 2) for i in range(len(stats_to_plot))]
 
     fig, ax = plt.subplots(figsize=(12, 8))
 
-    # Plot statistical ranges (min, q1, median, q3, max)
+    # Plot statistical ranges (min, p25, median, p75, max)
     for i, stat in enumerate(stats_to_plot):
         ax.plot(
             pd.to_datetime(summary_df["time_of_day"], format="%H:%M:%S"),
@@ -277,10 +308,14 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
         label="mean",
     )
 
-    # When no specific var-name for the axis is defined, we use the 
-    # original column name (plot_var)
+    # When no specific var-name for the axis is defined, derive it from
+    # etdmap unit metadata. For Diff columns we converted to kW above,
+    # so the label reflects that instead of the raw kWh-per-interval.
     if plot_var_name is None:
-        plot_var_name=plot_var
+        if converted_unit:
+            plot_var_name = f"{plot_var} ({converted_unit})"
+        else:
+            plot_var_name = axis_label_with_unit(plot_var)
 
     # Axis labels and formatting
     ax.set_ylabel(plot_var_name, color="purple")
@@ -315,6 +350,7 @@ def plot_daily_profile_mean_combined(
         plot_vars: list[str],
         title: str="Variabelen per 100m2 (kW)",
         plot_var_names: Optional[list[str]]=None,
+        y_label: Optional[str]=None,
         project_id: Optional[str|int]=None,
         save_fig_path: Optional[str]=None,
 
@@ -369,7 +405,27 @@ def plot_daily_profile_mean_combined(
     Saved plot to daily_profile.png
     """
     # add time_of_day column that sets the times correctly.
-    df = etdtransform.calculated_columns.add_normalized_datetime(df)
+    df = etdtransform.calculated_columns.add_normalized_datetime(df).copy()
+
+    # For Diff columns, convert per-row energy to average power (kW) so
+    # the overlay reads naturally as a power profile. Mixed Diff and
+    # non-Diff in the same call is allowed; each variable is converted
+    # individually if applicable.
+    converted_any = False
+    if "ReadingDate" in df.columns:
+        try:
+            from etdanalyze.units import (
+                infer_interval_from_readingdate,
+                convert_diff_to_power,
+            )
+            interval = infer_interval_from_readingdate(df)
+        except Exception:
+            interval = None
+        if interval is not None:
+            for var in plot_vars:
+                if var in df.columns and var.endswith("Diff"):
+                    df[var] = convert_diff_to_power(df[var], interval)
+                    converted_any = True
 
     fig, ax = plt.subplots(figsize=(16, 12))
     colors = [plt.cm.viridis_r(i / (len(plot_vars))) for i in range(len(plot_vars))]  # Assign distinct colors
@@ -396,7 +452,16 @@ def plot_daily_profile_mean_combined(
         )
 
     ax.set_xlabel("Tijd")
-    ax.set_ylabel("Variabelen per 100m2 (kW)")
+    # y-label: caller override > derived from first plot_var (or "kW" if any
+    # Diff was converted) > legacy fallback "Variabelen per 100m2 (kW)".
+    if y_label is None:
+        if converted_any:
+            y_label = "Variabelen (kW)"
+        elif plot_vars:
+            y_label = axis_label_with_unit(plot_vars[0])
+        else:
+            y_label = "Variabelen per 100m2 (kW)"
+    ax.set_ylabel(y_label)
     ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax.autoscale(enable=True, axis="x", tight=True)
@@ -428,7 +493,7 @@ def plot_weekly_profile(
 
     Shows mean values for each (day-of-week, hour-of-day) combination,
     producing 168 data points across 7 day panels on a single x-axis.
-    Min/q1/median/q3/max bands are shown as shading and thin lines.
+    Min/p25/median/p75/max bands are shown as shading and thin lines.
 
     Parameters
     ----------
@@ -461,15 +526,15 @@ def plot_weekly_profile(
 
     grouped = df.groupby("week_slot")[plot_var]
     summary = grouped.agg(["mean", "min", "max"]).reset_index()
-    summary["q1"] = grouped.quantile(0.25).values
-    summary["q3"] = grouped.quantile(0.75).values
+    summary["p25"] = grouped.quantile(0.25).values
+    summary["p75"] = grouped.quantile(0.75).values
     summary["median"] = grouped.median().values
 
     fig, ax = plt.subplots(figsize=(16, 6))
     ax.fill_between(summary["week_slot"], summary["min"], summary["max"],
                     alpha=0.12, color="steelblue", label="min-max")
-    ax.fill_between(summary["week_slot"], summary["q1"], summary["q3"],
-                    alpha=0.25, color="steelblue", label="q1-q3")
+    ax.fill_between(summary["week_slot"], summary["p25"], summary["p75"],
+                    alpha=0.25, color="steelblue", label="p25-p75")
     ax.plot(summary["week_slot"], summary["median"],
             linewidth=0.9, color="steelblue", alpha=0.7, label="median")
     ax.plot(summary["week_slot"], summary["mean"],
@@ -509,7 +574,7 @@ def plot_annual_profile(
     """
     Plot the annual profile (jaarprofiel) for a variable.
 
-    Shows mean and q1–q3 band for each day-of-year (1–366),
+    Shows mean and p25–p75 band for each day-of-year (1–366),
     revealing seasonal patterns across the year.
 
     Parameters
@@ -541,12 +606,12 @@ def plot_annual_profile(
 
     grouped = df.groupby("day_of_year")[plot_var]
     summary = grouped.mean().reset_index(name="mean")
-    summary["q1"] = grouped.quantile(0.25).values
-    summary["q3"] = grouped.quantile(0.75).values
+    summary["p25"] = grouped.quantile(0.25).values
+    summary["p75"] = grouped.quantile(0.75).values
 
     fig, ax = plt.subplots(figsize=(16, 6))
-    ax.fill_between(summary["day_of_year"], summary["q1"], summary["q3"],
-                    alpha=0.25, color="steelblue", label="q1-q3")
+    ax.fill_between(summary["day_of_year"], summary["p25"], summary["p75"],
+                    alpha=0.25, color="steelblue", label="p25-p75")
     ax.plot(summary["day_of_year"], summary["mean"],
             linewidth=1.5, color="purple", label="mean")
 
@@ -570,6 +635,44 @@ def plot_annual_profile(
         plt.close(fig)
     else:
         return fig
+
+
+def _ols_overlay(ax, x: pd.Series, y: pd.Series, label: str = "OLS fit") -> None:
+    """Overlay a simple linear OLS fit on an existing scatter axis.
+
+    Uses pandas ``.cov() / .var()`` (per ADR-005 / parent ADR-005 -- no
+    numpy import in analytics) and skips silently when there is too
+    little data or zero variance to fit.
+
+    The fit reduces visual density on COP scatter plots (MW100): the
+    eye reads the slope rather than tracking individual dots.
+    """
+    if len(x) < 5:
+        return
+    try:
+        var_x = float(x.var())
+        if not (var_x > 0):
+            return
+        slope = float(x.cov(y) / var_x)
+        intercept = float(y.mean() - slope * x.mean())
+    except Exception:
+        return
+    x_min, x_max = float(x.min()), float(x.max())
+    if not (x_max > x_min):
+        return
+    x_line = pd.Series([x_min, x_max])
+    y_line = slope * x_line + intercept
+    # R^2 for the legend label
+    y_hat = slope * x + intercept
+    ss_res = float(((y - y_hat) ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    r2 = (1 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+    ax.plot(
+        x_line, y_line,
+        color="tomato", linewidth=2,
+        label=f"{label}: slope={slope:.3f}, R^2={r2:.2f}",
+    )
+    ax.legend(loc="best", fontsize=9)
 
 
 def plot_cop_vs_temp(
@@ -612,7 +715,8 @@ def plot_cop_vs_temp(
 
     fig, ax = plt.subplots(figsize=(10, 7))
     ax.scatter(plot_df[temp_col], plot_df[cop_col],
-               alpha=0.4, s=20, color="steelblue")
+               alpha=0.4, s=20, color="steelblue", label="dagelijks")
+    _ols_overlay(ax, plot_df[temp_col], plot_df[cop_col], label="OLS-trend")
     ax.set_xlabel(f"Outdoor temperature (°C) [{temp_col}]")
     ax.set_ylabel(f"COP [{cop_col}]")
     plt.title(title or "COP vs outdoor temperature")
@@ -673,7 +777,8 @@ def plot_cop_vs_delta_t(
 
     fig, ax = plt.subplots(figsize=(10, 7))
     ax.scatter(plot_df["delta_T"], plot_df[cop_col],
-               alpha=0.4, s=20, color="steelblue")
+               alpha=0.4, s=20, color="steelblue", label="dagelijks")
+    _ols_overlay(ax, plot_df["delta_T"], plot_df[cop_col], label="OLS-trend")
     ax.set_xlabel(f"Temperature lift dT (degC)  [{supply_temp_col} - {outdoor_temp_col}]")
     ax.set_ylabel(f"COP [{cop_col}]")
     plt.title(title or "COP vs temperature lift (dT)")
@@ -1122,9 +1227,9 @@ def plot_household_range_strips(
     x-axis. Within each strip three nested intervals overlay:
 
       - lightest layer: ``min`` to ``max`` (full observed range)
-      - mid layer:      ``quantile_1`` to ``quantile_99``
+      - mid layer:      ``p01`` to ``p99``
                         (true tail; ignores single-record extremes)
-      - darkest layer:  ``quantile_25`` to ``quantile_75`` (IQR)
+      - darkest layer:  ``p25`` to ``p75`` (IQR)
       - bright dot at:  ``median``
 
     The intervals are nested so when overlaid the outer band is
@@ -1154,10 +1259,10 @@ def plot_household_range_strips(
     if plot_df.empty:
         return None
 
-    has_q1  = "quantile_1"  in plot_df.columns
-    has_q25 = "quantile_25" in plot_df.columns
-    has_q75 = "quantile_75" in plot_df.columns
-    has_q99 = "quantile_99" in plot_df.columns
+    has_q1  = "p01"  in plot_df.columns
+    has_q25 = "p25" in plot_df.columns
+    has_q75 = "p75" in plot_df.columns
+    has_q99 = "p99" in plot_df.columns
 
     # Stable order: project first, then household id within project.
     plot_df = plot_df.sort_values([project_col, id_col], kind="stable").reset_index(drop=True)
@@ -1211,14 +1316,14 @@ def plot_household_range_strips(
             zorder=2,
         ))
 
-    # q1..q99 band -- medium opacity.
+    # p25..p99 band -- medium opacity.
     if has_q1 and has_q99:
-        q1s = pd.to_numeric(plot_df["quantile_1"], errors="coerce").to_numpy(dtype=float)
-        q99s = pd.to_numeric(plot_df["quantile_99"], errors="coerce").to_numpy(dtype=float)
+        p01s = pd.to_numeric(plot_df["p01"], errors="coerce").to_numpy(dtype=float)
+        p99s = pd.to_numeric(plot_df["p99"], errors="coerce").to_numpy(dtype=float)
         segs_q99, q99_colors = [], []
         for i in range(n):
-            if not (np.isnan(q1s[i]) or np.isnan(q99s[i])):
-                segs_q99.append([(xs[i], q1s[i]), (xs[i], q99s[i])])
+            if not (np.isnan(p01s[i]) or np.isnan(p99s[i])):
+                segs_q99.append([(xs[i], p01s[i]), (xs[i], p99s[i])])
                 q99_colors.append(_with_alpha(rgba_per_row[i], 0.55))
         if segs_q99:
             ax.add_collection(LineCollection(
@@ -1228,12 +1333,12 @@ def plot_household_range_strips(
 
     # q25..q75 band (IQR) -- highest opacity.
     if has_q25 and has_q75:
-        q25s = pd.to_numeric(plot_df["quantile_25"], errors="coerce").to_numpy(dtype=float)
-        q75s = pd.to_numeric(plot_df["quantile_75"], errors="coerce").to_numpy(dtype=float)
+        p25s = pd.to_numeric(plot_df["p25"], errors="coerce").to_numpy(dtype=float)
+        p75s = pd.to_numeric(plot_df["p75"], errors="coerce").to_numpy(dtype=float)
         segs_iqr, iqr_colors = [], []
         for i in range(n):
-            if not (np.isnan(q25s[i]) or np.isnan(q75s[i])):
-                segs_iqr.append([(xs[i], q25s[i]), (xs[i], q75s[i])])
+            if not (np.isnan(p25s[i]) or np.isnan(p75s[i])):
+                segs_iqr.append([(xs[i], p25s[i]), (xs[i], p75s[i])])
                 iqr_colors.append(_with_alpha(rgba_per_row[i], 0.95))
         if segs_iqr:
             ax.add_collection(LineCollection(
@@ -1322,10 +1427,10 @@ def plot_household_range_heatmap(
     discrete bands, with a flat colour from a friendly palette:
 
       - **last percentile** (``#cda4a4``): the outermost 1% on
-        each side -- ``min..q1`` and ``q99..max``. Muted dusty
+        each side -- ``min..p25`` and ``p99..max``. Muted dusty
         rose so a wide last-percentile band signals the household
         has extreme outliers without visually drowning the rest.
-      - **tail** (``#f4a261``): ``q1..q25`` and ``q75..q99``.
+      - **tail** (``#f4a261``): ``p25..q25`` and ``q75..p99``.
         Warm peach -- meaningful but not loud.
       - **IQR** (``#2a6f97``): ``q25..q75``. Solid deep teal-blue
         for the interquartile range where the household spends
@@ -1338,7 +1443,7 @@ def plot_household_range_heatmap(
     Parameters
     ----------
     exclude_last_percentile : bool, optional
-        When True, clip the y-axis to ``q1..q99`` (the inner 98%)
+        When True, clip the y-axis to ``p25..p99`` (the inner 98%)
         and skip drawing the last-percentile band entirely. Useful
         when the extreme outliers stretch the y-axis so far that
         the IQR is squashed to a few pixels. Default False.
@@ -1346,8 +1451,8 @@ def plot_household_range_heatmap(
         Vertical resolution. Default 300.
 
     Required columns: ``id_col``, ``project_col``, ``min``, ``max``,
-    ``median``, ``quantile_1``, ``quantile_25``, ``quantile_75``,
-    ``quantile_99``.
+    ``median``, ``p01``, ``p25``, ``p75``,
+    ``p99``.
     """
     from matplotlib.colors import BoundaryNorm, ListedColormap
     import matplotlib.patheffects as path_effects
@@ -1355,7 +1460,7 @@ def plot_household_range_heatmap(
     required = {
         id_col, project_col,
         "min", "max", "median",
-        "quantile_1", "quantile_25", "quantile_75", "quantile_99",
+        "p01", "p25", "p75", "p99",
     }
     missing = required - set(df.columns)
     if missing:
@@ -1365,7 +1470,7 @@ def plot_household_range_heatmap(
 
     plot_df = df.dropna(subset=[
         "min", "max", "median",
-        "quantile_1", "quantile_25", "quantile_75", "quantile_99",
+        "p01", "p25", "p75", "p99",
     ]).copy()
     if plot_df.empty:
         return None
@@ -1374,16 +1479,16 @@ def plot_household_range_heatmap(
     n = len(plot_df)
 
     mins  = plot_df["min"].astype(float).to_numpy()
-    q1s   = plot_df["quantile_1"].astype(float).to_numpy()
-    q25s  = plot_df["quantile_25"].astype(float).to_numpy()
+    p01s   = plot_df["p01"].astype(float).to_numpy()
+    p25s  = plot_df["p25"].astype(float).to_numpy()
     meds  = plot_df["median"].astype(float).to_numpy()
-    q75s  = plot_df["quantile_75"].astype(float).to_numpy()
-    q99s  = plot_df["quantile_99"].astype(float).to_numpy()
+    p75s  = plot_df["p75"].astype(float).to_numpy()
+    p99s  = plot_df["p99"].astype(float).to_numpy()
     maxs  = plot_df["max"].astype(float).to_numpy()
 
     if exclude_last_percentile:
-        y_lo = float(np.nanmin(q1s))
-        y_hi = float(np.nanmax(q99s))
+        y_lo = float(np.nanmin(p01s))
+        y_hi = float(np.nanmax(p99s))
     else:
         y_lo = float(np.nanmin(mins))
         y_hi = float(np.nanmax(maxs))
@@ -1394,24 +1499,24 @@ def plot_household_range_heatmap(
 
     grid = y_centres[:, None]  # (n_y_bins, 1)
     M = mins[None, :]
-    Q1 = q1s[None, :]
-    Q25 = q25s[None, :]
-    Q75 = q75s[None, :]
-    Q99 = q99s[None, :]
+    P01 = p01s[None, :]
+    P25 = p25s[None, :]
+    P75 = p75s[None, :]
+    P99 = p99s[None, :]
     MAX = maxs[None, :]
 
     # Discrete band labels:
-    #   1 = last percentile  (min..q1  OR  q99..max)  -- only when shown
-    #   2 = tail             (q1..q25  OR  q75..q99)
+    #   1 = last percentile  (min..p25  OR  p99..max)  -- only when shown
+    #   2 = tail             (p25..q25  OR  q75..p99)
     #   3 = IQR              (q25..q75)
     # 0 / NaN = outside the displayed band range -> transparent
     bands = np.zeros((n_y_bins, n), dtype=float)
     if not exclude_last_percentile:
-        bands[(grid >= M)   & (grid <= Q1)]  = 1
-        bands[(grid >  Q99) & (grid <= MAX)] = 1
-    bands[(grid >  Q1)  & (grid <= Q25)] = 2
-    bands[(grid >  Q75) & (grid <= Q99)] = 2
-    bands[(grid >  Q25) & (grid <= Q75)] = 3
+        bands[(grid >= M)   & (grid <= P01)]  = 1
+        bands[(grid >  P99) & (grid <= MAX)] = 1
+    bands[(grid >  P01)  & (grid <= P25)] = 2
+    bands[(grid >  P75) & (grid <= P99)] = 2
+    bands[(grid >  P25) & (grid <= P75)] = 3
     bands[bands == 0] = np.nan
 
     # Friendly palette: muted last-percentile, warm tail, solid IQR.
@@ -1487,7 +1592,7 @@ def plot_household_range_heatmap(
         if u and "(" not in base_title:
             base_title = f"{base_title} ({u})"
     if exclude_last_percentile:
-        base_title = f"{base_title}  (q1..q99 only)"
+        base_title = f"{base_title}  (p25..p99 only)"
     ax.set_title(base_title, fontsize=10)
 
     # Discrete colourbar -- precise labels.
