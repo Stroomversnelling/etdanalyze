@@ -763,8 +763,15 @@ def plot_daily_profile_mean_combined(
         if not plot_vars:
             raise ValueError("plot_daily_profile_mean_combined: plot_vars is empty.")
         first = plot_vars[0]
-        first_overrides = {first: converted_units[first]} if first in converted_units else None
-        y_label = axis_label_with_unit(first, overrides=first_overrides)
+        # Merge caller's overrides + any internal conversion overrides
+        # so derived columns (not in the data model) resolve cleanly.
+        first_overrides = dict(overrides) if overrides else {}
+        if first in converted_units:
+            first_overrides[first] = converted_units[first]
+        y_label = axis_label_with_unit(
+            first,
+            overrides=first_overrides if first_overrides else None,
+        )
     ax.set_ylabel(y_label)
     ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
@@ -1088,6 +1095,7 @@ def plot_cop_vs_temp(
         save_fig_path: Optional[str] = None,
         alpha: float = 0.4,
         y_clip: Optional[tuple] = None,
+        trend_style: str = "ols",
 ):
     """
     Scatter plot of daily average COP against outdoor temperature.
@@ -1104,10 +1112,32 @@ def plot_cop_vs_temp(
 
     ``y_clip=(ymin, ymax)`` sets ``ax.set_ylim`` *only* -- impossible
     COP outliers (divide-by-near-zero artifacts on mostly-standby
-    days) are kept in the data and in the OLS-trend computation; they
+    days) are kept in the data and in the trend computation; they
     are just visually clipped to keep the physically-plausible cloud
-    readable. If the trend ends up flat-with-R^2=0, that is a real
-    signal that outliers dominate.
+    readable.
+
+    ``trend_style`` -- which trend overlay to draw:
+
+      - ``"ols"`` (default): linear least-squares fit + R^2 annotation.
+        Defensible for per-project / per-household views where the
+        linear assumption fits the underlying physics. When ``y_clip``
+        is set, the OLS is computed on data within the visible band so
+        outliers don't drag the line.
+      - ``"binned_median"``: per-1degC-bin median curve. Robust to
+        outliers and does NOT assume a linear relationship. Use on
+        pooled (whole-population) views where one straight line is
+        misleading: at any given temperature the population spreads
+        across the whole COP range, so a binned median tells the
+        reader where the central tendency sits at each temperature
+        bin without claiming a portfolio-wide linear model exists.
+      - ``"binned_bands"``: per-1degC-bin canonical 4-layer band
+        stack (min-max + p01-p99 + p25-p75 + median + mean), matching
+        the visual grammar of the profile plots. Communicates BOTH
+        central tendency AND spread at each temperature, addressing
+        the concern that a single median curve hides whether the
+        population is tightly or widely distributed at that
+        temperature.
+      - ``"none"``: no overlay; just the scatter.
 
     Parameters
     ----------
@@ -1149,14 +1179,9 @@ def plot_cop_vs_temp(
     fig, ax = plt.subplots(figsize=(10, 7))
     ax.scatter(plot_df[temp_col], plot_df[cop_col],
                alpha=alpha, s=20, color="steelblue", label="dagelijks")
-    # OLS trend: when y_clip is set, compute on data within the
-    # visible band so the trend reflects the physically-plausible
-    # cloud the reader can see. Without this, impossible-COP outliers
-    # (visually clipped above the y-axis) still dominate the OLS and
-    # produce a flat line with R^2=0 that is unhelpful for the
-    # visible population. Outliers remain in the scatter (just clipped
-    # visually); we do not hide them, we just don't let them drag the
-    # trend line.
+    # Trend overlay -- driven by ``trend_style``. When y_clip is set,
+    # compute on data within the visible band so impossible-COP
+    # outliers (visually clipped above the y-axis) don't dominate.
     if y_clip is not None:
         trend_df = plot_df[
             (plot_df[cop_col] >= y_clip[0])
@@ -1164,8 +1189,86 @@ def plot_cop_vs_temp(
         ]
     else:
         trend_df = plot_df
-    if len(trend_df) >= 2:
-        _ols_overlay(ax, trend_df[temp_col], trend_df[cop_col], label="OLS-trend")
+
+    if trend_style == "ols":
+        if len(trend_df) >= 2:
+            _ols_overlay(
+                ax, trend_df[temp_col], trend_df[cop_col],
+                label="OLS-trend",
+            )
+    elif trend_style == "binned_median":
+        # Per-1degC-bin median curve. Bin edges at integers; each bin
+        # contributes one point at (bin midpoint, median COP in bin),
+        # connected with a line. Bins with fewer than _MIN_BIN points
+        # are dropped so a sparse tail (e.g. -10 degC with 3 obs)
+        # doesn't drive an unstable jump in the curve.
+        _MIN_BIN = 20
+        if len(trend_df) >= _MIN_BIN:
+            t = trend_df[temp_col].to_numpy(dtype=float)
+            y = trend_df[cop_col].to_numpy(dtype=float)
+            tmin = int(np.floor(np.nanmin(t)))
+            tmax = int(np.ceil(np.nanmax(t)))
+            edges = np.arange(tmin, tmax + 1, dtype=float)
+            mids, meds = [], []
+            for lo in edges[:-1]:
+                hi = lo + 1.0
+                mask = (t >= lo) & (t < hi)
+                if mask.sum() >= _MIN_BIN:
+                    mids.append(lo + 0.5)
+                    meds.append(float(np.median(y[mask])))
+            if mids:
+                ax.plot(
+                    mids, meds, color="crimson", linewidth=2,
+                    marker="o", markersize=4,
+                    label=f"per-1degC bin median (>= {_MIN_BIN} obs/bin)",
+                )
+    elif trend_style == "binned_bands":
+        # Per-1degC-bin canonical 4-layer band stack (min-max +
+        # p01-p99 + p25-p75 + median + mean), matching the profile-
+        # plot visual grammar. Same min-bin guard so sparse tails
+        # don't drive unstable bands.
+        _MIN_BIN = 20
+        if len(trend_df) >= _MIN_BIN:
+            t = trend_df[temp_col].to_numpy(dtype=float)
+            y = trend_df[cop_col].to_numpy(dtype=float)
+            tmin = int(np.floor(np.nanmin(t)))
+            tmax = int(np.ceil(np.nanmax(t)))
+            mids, mins_, p01s, p25s, meds, means, p75s, p99s, maxs_ = (
+                [], [], [], [], [], [], [], [], []
+            )
+            for lo in range(tmin, tmax):
+                hi = lo + 1.0
+                mask = (t >= lo) & (t < hi)
+                if mask.sum() >= _MIN_BIN:
+                    y_bin = y[mask]
+                    mids.append(lo + 0.5)
+                    mins_.append(float(np.min(y_bin)))
+                    p01s.append(float(np.quantile(y_bin, 0.01)))
+                    p25s.append(float(np.quantile(y_bin, 0.25)))
+                    meds.append(float(np.median(y_bin)))
+                    means.append(float(np.mean(y_bin)))
+                    p75s.append(float(np.quantile(y_bin, 0.75)))
+                    p99s.append(float(np.quantile(y_bin, 0.99)))
+                    maxs_.append(float(np.max(y_bin)))
+            if mids:
+                ax.fill_between(mids, mins_, maxs_, alpha=0.10,
+                                color="crimson", label="bin min-max")
+                ax.fill_between(mids, p01s, p99s, alpha=0.18,
+                                color="crimson", label="bin p01-p99")
+                ax.fill_between(mids, p25s, p75s, alpha=0.30,
+                                color="crimson", label="bin p25-p75")
+                ax.plot(mids, meds, color="crimson", linewidth=1.4,
+                        marker="o", markersize=3,
+                        label="bin median")
+                ax.plot(mids, means, color="purple", linewidth=2,
+                        label="bin mean")
+    elif trend_style == "none":
+        pass
+    else:
+        raise ValueError(
+            f"plot_cop_vs_temp: trend_style={trend_style!r} not in "
+            f"{{'ols', 'binned_median', 'binned_bands', 'none'}}"
+        )
     # Layer 3 strict-unit assertions -- COP is dimensionless (ratio);
     # outdoor temp is a temperature.
     from etdanalyze.units import assert_unit_in_classes
