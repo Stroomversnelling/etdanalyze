@@ -37,16 +37,42 @@ class TestUnitLookup:
         assert unit_for_column("ElektriciteitNetgebruikHoogDiff") == "kWh"
 
     def test_unknown_returns_empty(self):
+        # Low-level helper stays silent on unknown -- axis_label_with_unit
+        # is the layer that raises.
         assert unit_for_column("__not_a_real_column__") == ""
 
     def test_axis_label_appends_when_known(self):
         assert axis_label_with_unit("ElektriciteitNetgebruikHoog", "median") == "median (kWh)"
 
-    def test_axis_label_passes_through_when_unknown(self):
-        assert axis_label_with_unit("__not_a_real_column__", "median") == "median"
+    def test_axis_label_raises_on_unknown(self):
+        # Loud failure: callers must pass an override for non-data-model columns.
+        with pytest.raises(KeyError, match="no unit known"):
+            axis_label_with_unit("__not_a_real_column__", "median")
 
     def test_axis_label_defaults_base_to_column(self):
         assert axis_label_with_unit("ElektriciteitNetgebruikHoog") == "ElektriciteitNetgebruikHoog (kWh)"
+
+    def test_overrides_unknown_column(self):
+        # Override allows labelling a column that isn't in the data model.
+        assert axis_label_with_unit(
+            "COP", "COP", overrides={"COP": ""}
+        ) == "COP"
+
+    def test_overrides_take_precedence_over_data_model(self):
+        # When a Diff column has been display-converted to kW (post-helper),
+        # the caller overrides the data-model unit (kWh) with the
+        # display unit.
+        assert axis_label_with_unit(
+            "ElektriciteitNetgebruikHoogDiff", "median",
+            overrides={"ElektriciteitNetgebruikHoogDiff": "kW"},
+        ) == "median (kW)"
+
+    def test_unitless_override_returns_bare_base(self):
+        # An empty-string override is the explicit unitless marker.
+        assert axis_label_with_unit(
+            "SomeUnitlessRatio", "median",
+            overrides={"SomeUnitlessRatio": ""},
+        ) == "median"
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +339,27 @@ class TestBoxwhiskerExtensions:
             save_fig_path=str(out),
         )
         assert out.exists() and out.stat().st_size > 0
+
+    def test_raises_on_all_na_value_col(self):
+        """Strict empty-data contract: when every row's value_col is NA
+        the helper raises ValueError pointing the caller at upstream
+        coverage filtering. No silent return / no empty plot."""
+        df = self._frame()
+        df["median"] = pd.NA
+        with pytest.raises(ValueError, match="no non-NA rows"):
+            plot_boxwhisker_comparison(
+                df, value_col="median", x_group="ProjectIdBSV",
+                color_group="WoningType",
+            )
+
+    def test_raises_on_empty_input(self):
+        """Same guard, different shape -- zero rows in df."""
+        df = pd.DataFrame(columns=["HuisIdBSV", "ProjectIdBSV", "WoningType", "median"])
+        with pytest.raises(ValueError, match="no non-NA rows"):
+            plot_boxwhisker_comparison(
+                df, value_col="median", x_group="ProjectIdBSV",
+                color_group="WoningType",
+            )
 
     def test_secondary_axis_renders_as_stacked_subplot(self, tmp_path):
         """When secondary_axis_data is provided, the figure must have two

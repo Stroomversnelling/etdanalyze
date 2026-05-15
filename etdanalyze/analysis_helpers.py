@@ -715,6 +715,117 @@ def calculate_cop(
 # Heat signature fitting
 # ---------------------------------------------------------------------------
 
+def classify_coverage(
+    df: pd.DataFrame,
+    value_cols: list[str],
+    group_cols: Optional[list[str]] = None,
+) -> pd.DataFrame:
+    """Per-(variable, group) coverage rows for the strict empty-data contract.
+
+    The Innax + general analysis pipeline asks: "for variable V, which
+    groups have actual data, and which are empty / constant?" The
+    answer drives the plot-helper empty-data guards
+    (plots that would receive zero rows are skipped upstream) and the
+    report-builder annotation (sections call out partial-coverage vars
+    in prose).
+
+    The data model + supplier mapping decide whether a variable *should*
+    exist for a project; this function reports what *does* exist. No
+    judgement is made about gaps -- callers consume the table to decide
+    plot/skip and what prose to render.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Already-loaded analysis frame. Must contain ``value_cols`` and
+        all ``group_cols``.
+    value_cols : list[str]
+        Variable column names to classify.
+    group_cols : list[str], optional
+        Columns to group by. Defaults to
+        ``["ProjectIdBSV", "WoningType"]``. Pass a different list when
+        your report uses a different grain (e.g. add ``"period"`` if
+        the frame already has a season filter applied per row, or
+        ``["Dataleverancier"]`` for a supplier-level coverage view).
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (variable, group). Columns:
+
+          ``variable`` : str
+              From ``value_cols``.
+          group cols  : as supplied
+              The group key values.
+          ``n_rows`` : int
+              Row count (zero if the (variable, group) combo has no
+              rows in ``df`` at all).
+          ``n_nonnull`` : int
+              Count of non-NA observations of ``variable`` in the
+              group.
+          ``is_empty`` : bool
+              True when ``n_nonnull == 0``.
+          ``is_constant`` : bool
+              True when ``n_nonnull > 0`` and the variable's
+              standard deviation in the group is zero (numeric / bool
+              columns only; non-numeric columns return ``False``).
+
+    Notes
+    -----
+    Mirrors the spirit of ``etdworkflow.analyze_data_report.
+    _classify_column_activity`` (per-HH x col) but works at an
+    arbitrary group grain so other reports / sub-tables can reuse it.
+    """
+    if group_cols is None:
+        group_cols = ["ProjectIdBSV", "WoningType"]
+
+    missing = [c for c in (*group_cols, *value_cols) if c not in df.columns]
+    if missing:
+        raise KeyError(
+            f"classify_coverage: column(s) {missing!r} not in df. "
+            f"df.columns={list(df.columns)!r}"
+        )
+
+    # Build one (group, variable) frame by stacking per-variable views.
+    parts: list[pd.DataFrame] = []
+    base = df[group_cols + value_cols].copy()
+    grouped = base.groupby(group_cols, observed=True, dropna=False)
+    n_rows = grouped.size().rename("n_rows").reset_index()
+
+    for var in value_cols:
+        ser = base[var]
+        n_nonnull = (
+            base.assign(_nn=ser.notna())
+                .groupby(group_cols, observed=True, dropna=False)["_nn"]
+                .sum()
+                .rename("n_nonnull")
+                .reset_index()
+        )
+        if pd.api.types.is_bool_dtype(ser) or pd.api.types.is_numeric_dtype(ser):
+            stds = grouped[var].std(ddof=0).rename("_std").reset_index()
+        else:
+            stds = n_nonnull.copy()
+            stds["_std"] = pd.NA
+
+        sub = n_rows.merge(n_nonnull, on=group_cols, how="outer")
+        sub = sub.merge(stds, on=group_cols, how="left")
+        sub["variable"] = var
+        sub["is_empty"] = sub["n_nonnull"].fillna(0) == 0
+        sub["is_constant"] = (
+            (sub["n_nonnull"].fillna(0) > 0)
+            & (sub["_std"].fillna(1.0) == 0)
+        )
+        sub = sub.drop(columns=["_std"])
+        cols = ["variable", *group_cols, "n_rows", "n_nonnull",
+                "is_empty", "is_constant"]
+        parts.append(sub[cols])
+
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
+        columns=["variable", *group_cols, "n_rows", "n_nonnull",
+                 "is_empty", "is_constant"]
+    )
+
+
 def compute_stats_table(
         df: pd.DataFrame,
         group_cols: list,
@@ -813,10 +924,10 @@ def compute_stats_table(
         method = aggregation_methods.get(col, "mean")
         if method == "sum":
             stats["period_total"] = stats["mean"].apply(
-                lambda m: (
+                lambda m, _col=col: (
                     mean_per_row_to_period_total(
-                        float(m), interval, period_days=period_days
-                    )
+                        float(m), _col, interval, period_days=period_days
+                    )[0]
                     if pd.notna(m) else pd.NA
                 )
             )
@@ -942,10 +1053,10 @@ def compute_stats_table_lazy(
         method = aggregation_methods.get(col, "mean")
         if method == "sum":
             sub["period_total"] = sub["mean"].apply(
-                lambda m: (
+                lambda m, _col=col: (
                     mean_per_row_to_period_total(
-                        float(m), interval, period_days=period_days
-                    )
+                        float(m), _col, interval, period_days=period_days
+                    )[0]
                     if pd.notna(m) else pd.NA
                 )
             )

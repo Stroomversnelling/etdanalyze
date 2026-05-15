@@ -1,3 +1,4 @@
+import textwrap
 from typing import Optional
 
 import etdtransform
@@ -24,26 +25,99 @@ def unit_for_column(col: str) -> str:
     """
     Return the unit string for a known model column, '' otherwise.
 
-    Handles Diff variants (which inherit unit from parent) because
-    thresholds.csv lists them explicitly.
+    Low-level lookup against ``etdmap.data_model.load_unit_map``. Handles
+    Diff variants (which inherit unit from parent) via the data-model
+    helper. Returns '' on unknown columns -- callers that need the
+    raise-on-missing contract should use ``axis_label_with_unit`` instead.
     """
     return _UNIT_MAP.get(col, "")
 
 
-def axis_label_with_unit(col: str, base_label: Optional[str] = None) -> str:
+def resolve_unit(col: str, overrides: Optional[dict] = None) -> str:
+    """
+    Return the unit string for a column, with optional per-call overrides.
+
+    Resolution order, strict-by-default:
+
+      1. ``overrides[col]`` -- caller-supplied. ``""`` is a valid value
+         that explicitly marks the column unitless. Use this for
+         derived / analysis-time variables that are not in the etdmap
+         data model (e.g. ``COP_system`` -> ``""``,
+         ``ZonopwekBrutoPer100M2KW`` -> ``"kW per 100m2"``) and for
+         display-unit variants produced upstream (e.g. a Diff column
+         after ``convert_diff_to_power`` is now kW, not kWh).
+      2. ``etdmap.data_model.load_unit_map`` via ``unit_for_column``.
+      3. If neither yields a unit, ``KeyError`` is raised. There is no
+         silent fallback -- callers must declare their unit.
+
+    Returns
+    -------
+    str
+        The unit string (possibly empty ``""`` for explicitly unitless).
+
+    Raises
+    ------
+    KeyError
+        Column is in neither ``overrides`` nor the data model.
+    """
+    if overrides is not None and col in overrides:
+        return overrides[col]
+    unit = unit_for_column(col)
+    if unit:
+        return unit
+    raise KeyError(
+        f"resolve_unit: no unit known for column {col!r}. "
+        f"Pass overrides={{{col!r}: '<unit>'}} (use '' for unitless)."
+    )
+
+
+def axis_label_with_unit(
+    col: str,
+    base_label: Optional[str] = None,
+    *,
+    overrides: Optional[dict] = None,
+) -> str:
     """
     Build a unit-suffixed axis label for a column.
+
+    Lookup order for the unit:
+      1. ``overrides[col]`` if ``overrides`` is provided and has the column.
+         An empty-string override is meaningful: it declares the value
+         genuinely unitless (e.g. COP) and the base label is returned bare.
+      2. ``etdmap.data_model.load_unit_map`` via ``unit_for_column``.
+      3. If neither yields a unit, ``KeyError`` is raised. There is no
+         silent bare-label fallback -- callers must pass an override for
+         any column outside the data model.
+
+    Parameters
+    ----------
+    col : str
+        Column name to label. Must either be in the data model or appear
+        in ``overrides``.
+    base_label : str, optional
+        Text before the unit suffix. Defaults to ``col``.
+    overrides : dict, optional
+        Per-call ``{col: unit}`` map. Pass ``""`` as the unit value for
+        explicitly unitless quantities. Per-call overrides are required
+        when the value being labelled is a display-unit variant
+        (e.g. ``"kW"`` after ``convert_diff_to_power`` produced kW from a
+        kWh Diff column) or when the column is not in the data model.
 
     Examples
     --------
     >>> axis_label_with_unit("ElektriciteitNetgebruikHoog", "median value")
     'median value (kWh)'
-    >>> axis_label_with_unit("UnknownColumn", "median value")
-    'median value'
+    >>> axis_label_with_unit(
+    ...     "ElektriciteitNetgebruikHoogDiff", "median",
+    ...     overrides={"ElektriciteitNetgebruikHoogDiff": "kW"},
+    ... )
+    'median (kW)'
+    >>> axis_label_with_unit("COP", "COP", overrides={"COP": ""})
+    'COP'
     """
     base = base_label if base_label is not None else col
-    u = unit_for_column(col)
-    return f"{base} ({u})" if u else base
+    unit = resolve_unit(col, overrides=overrides)
+    return f"{base} ({unit})" if unit else base
 
 
 # ---------------------------------------------------------------------------
@@ -151,48 +225,98 @@ def detect_value_range_clusters(
 def plot_var_vs_temp(
         df: pd.DataFrame,
         var: str,
-        interval:str='5min',
-        title:str='',
-        plot_var_name: Optional[str]=None,
-        project_id: Optional[str|int]=None
+        temp_col: str,
+        *,
+        title: str = "",
+        plot_var_name: Optional[str] = None,
+        project_id: Optional[str | int] = None,
+        overrides: Optional[dict] = None,
         ):
     """
-    Plot var over time, for a specific project if supplied.
+    Plot ``var`` and ``temp_col`` against ``ReadingDate`` on a twinx axes.
+
+    Strict-contract version: the helper does NOT guess data semantics
+    from column names. It plots ``df[var]`` on the left axis and
+    ``df[temp_col]`` on the right axis, sourcing units from the etdmap
+    data model (or ``overrides``). If a caller wants a derived display
+    (e.g. kW power on the left axis instead of the kWh-per-row stored
+    in the data model), they convert at the call site (see
+    ``etdanalyze.units.convert_diff_to_power``) AND declare the
+    post-conversion unit via ``overrides={var: "kW"}``.
 
     Parameters
     ----------
     df : pandas.DataFrame
-        DataFrame containing the dataset.
+        DataFrame containing the dataset; must have ``ReadingDate``,
+        ``var`` and ``temp_col`` columns.
     var : str
-        The variable to plot (e.g., 'ElektriciteitsgebruikTotaalNetto').
-    interval: str
-        interval of df data. choice from '5min', '15min', '60min', '6h', '24h'
-    title: str
-        title for the graph
-    plot_var_name : str
-        Label for the y-axis representing the energy variable.
-    project_id : int
-        The ProjectIdBSV to filter on.
+        The variable on the left y-axis (e.g. ``"ElektriciteitsgebruikTotaalNetto"``).
+    temp_col : str
+        The temperature column on the right y-axis (e.g.
+        ``"TemperatuurBuitenWeerstation"``). No default -- the caller
+        is explicit about which temperature source they're plotting.
+    title : str, optional
+        Plot title.
+    plot_var_name : str, optional
+        Override the base label for ``var``. Defaults to ``var``.
+    project_id : int or str, optional
+        Filter ``df`` to that project before plotting.
+    overrides : dict, optional
+        ``{col: unit}`` mapping forwarded to ``axis_label_with_unit``
+        for both ``var`` and ``temp_col``. Required when either column
+        is not in the etdmap data model. Use ``""`` for unitless.
     """
     if project_id is not None:
         df = df[df['ProjectIdBSV'] == project_id].copy()
+    else:
+        df = df.copy()
 
-    # If no specific label name is supplied, use variable name.
     if plot_var_name is None:
-        plot_var_name=var
+        plot_var_name = var
 
-    plot_multiplier = etdtransform.calculated_columns.switch_multiplier(interval)
-    df[f'{var}KW'] = df[var] * plot_multiplier
+    # Strict empty-data guard. plot_var_vs_temp needs both axes' columns;
+    # a row missing either is unusable. Caller is responsible for
+    # ensuring coverage upstream.
+    paired = df[[var, temp_col]].dropna()
+    if paired.empty:
+        raise ValueError(
+            f"plot_var_vs_temp: no rows with both var={var!r} and "
+            f"temp_col={temp_col!r} non-NA"
+            f"{f' for project_id={project_id!r}' if project_id is not None else ''}. "
+            f"Check coverage upstream and skip the call."
+        )
+
     df = df.sort_values('ReadingDate')
+
+    # Layer 3 strict-unit assertion on both axes.
+    from etdanalyze.units import assert_unit_in_classes
+    var_unit = resolve_unit(var, overrides=overrides)
+    assert_unit_in_classes(
+        var_unit, var,
+        accepted_classes={"power", "temperature", "flow_rate", "state",
+                          "ratio", "volume_per_interval"},
+        plot_type="plot_var_vs_temp", axis="left y",
+    )
+    temp_unit_resolved = resolve_unit(temp_col, overrides=overrides)
+    assert_unit_in_classes(
+        temp_unit_resolved, temp_col,
+        accepted_classes={"temperature"},
+        plot_type="plot_var_vs_temp", axis="right y",
+    )
 
     fig, ax1 = plt.subplots(figsize=(16, 12))
     ax2 = ax1.twinx()
 
-    ax1.plot(df['ReadingDate'], df[f'{var}KW'], linestyle='-', linewidth=0.75, label=f'Project {project_id}')
-    ax1.set_ylabel(plot_var_name)
+    ax1.plot(df['ReadingDate'], df[var], linestyle='-', linewidth=0.75,
+             label=f'Project {project_id}' if project_id is not None else var)
+    ax1.set_ylabel(axis_label_with_unit(var, plot_var_name, overrides=overrides))
 
-    ax2.plot(df['ReadingDate'], df['Temperatuur'], color='orange', linewidth=0.75, label='Temperatuur (°C)')
-    ax2.set_ylabel('Temperatuur (°C)', color='orange')
+    ax2.plot(df['ReadingDate'], df[temp_col], color='orange', linewidth=0.75,
+             label=axis_label_with_unit(temp_col, overrides=overrides))
+    ax2.set_ylabel(
+        axis_label_with_unit(temp_col, overrides=overrides),
+        color='orange',
+    )
 
     ax1.set_xlabel('Datum')
 
@@ -207,17 +331,26 @@ def plot_var_vs_temp(
     plt.show()
 
 
-def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=None, save_fig_path=None):
+def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=None, overrides=None, save_fig_path=None, convert_from_energy_per_interval=None):
     """
     Plot seasonal data for a specific project, showing statistical ranges and mean values.
 
-    For ``*Diff`` columns (per-row energy in kWh-per-interval), the
-    interval is inferred from ``ReadingDate`` and the per-row values are
-    converted to average power (kW) before plotting -- a daily profile
-    is read most naturally in power units. The y-label reflects the
-    converted unit. For non-Diff columns the values are plotted as-is
-    and the y-label is built from etdmap unit metadata via
-    ``axis_label_with_unit``.
+    Unit handling is strict (Layer 3): the helper resolves ``plot_var``'s
+    declared unit via the data model (or ``overrides``) and asserts it
+    belongs to an instantaneous unit class (power / temperature /
+    flow_rate / state / ratio / volume_per_interval). Energy-per-interval
+    (kWh / Wh / GJ) is **not** accepted as a plot input -- a daily
+    profile reads as power, not as "kWh per row".
+
+    To plot an energy-per-interval column as a power profile, pass
+    ``convert_from_energy_per_interval=<pd.Timedelta>``. The helper then
+    L3-asserts the column is in the ``energy_per_interval`` class,
+    delegates to ``etdanalyze.units.convert_energy_per_interval_to_power``
+    (single source of truth for the conversion math), attaches the
+    converted Series as a new derived column on a shallow copy of ``df``
+    via ``df.assign`` (the input DataFrame is not mutated), and proceeds
+    with the converted column. Memory cost: one new Series the length
+    of the post-filter DataFrame.
 
     Parameters
     ----------
@@ -229,12 +362,25 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
         Optional. Title to be used in the plot. If not defined the plot_var_name or plot_var is used.
     plot_var_name : str
         A descriptive name for the plot variable (for axis labeling). When
-        omitted, the y-label is derived from etdmap unit metadata (with
-        the kW substitution for Diff columns described above).
+        omitted, the y-label is derived from etdmap unit metadata (or
+        ``overrides``).
     project_id: int|str:
         Optional: when provided the df is filtered to only contain data of that project.
+    overrides : dict, optional
+        ``{col: unit}`` map forwarded to ``resolve_unit`` /
+        ``axis_label_with_unit``. Required when ``plot_var`` is a
+        derived variant not in the etdmap data model (use ``""`` for
+        unitless).
     save_fig_path : str, optional
         File path to save the plot. If None, the figure is returned.
+    convert_from_energy_per_interval : pd.Timedelta or str, optional
+        Caller-declared row spacing of ``plot_var`` (e.g.
+        ``pd.Timedelta(hours=1)`` for a frame loaded from
+        ``household_60min.parquet``). When set, ``plot_var`` is
+        converted from energy-per-interval to mean power before
+        plotting. The caller passes the interval explicitly because
+        they know it from the data's provenance; helpers do not
+        infer.
 
     Returns
     -------
@@ -245,26 +391,51 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
     # add time_of_day column that sets the times correctly.
     df_normalized_dt = etdtransform.calculated_columns.add_normalized_datetime(df).copy()
 
-    # For Diff columns, convert per-row energy (kWh per interval) to
-    # average power (kW) so the daily profile reads in the variable's
-    # natural rate unit. Non-Diff columns are plotted as-is.
-    converted_unit = None
-    if plot_var.endswith("Diff") and "ReadingDate" in df_normalized_dt.columns:
-        try:
-            from etdanalyze.units import (
-                infer_interval_from_readingdate,
-                convert_diff_to_power,
+    # Optional caller-declared conversion: energy-per-interval -> power.
+    # Conversion math lives in etdanalyze.units; this helper just opts
+    # the column in. Returns df unchanged when the kwarg is None.
+    from etdanalyze.units import (
+        assert_unit_in_classes,
+        apply_optional_energy_conversion,
+    )
+    df_normalized_dt, plot_var, overrides = apply_optional_energy_conversion(
+        df_normalized_dt, plot_var, convert_from_energy_per_interval,
+        overrides, plot_type="plot_daily_profile",
+    )
+
+    # Layer 3 strict-unit assertion: a daily profile reads an
+    # instantaneous-style value at each minute-of-day, so the y-axis
+    # values must belong to an instantaneous unit class. The
+    # conversion above, if any, has already replaced the working
+    # column with a power Series so the assertion passes naturally.
+    unit = resolve_unit(plot_var, overrides=overrides)
+    assert_unit_in_classes(
+        unit, plot_var,
+        accepted_classes={"power", "power_per_area", "temperature",
+                          "flow_rate", "state", "ratio",
+                          "volume_per_interval"},
+        plot_type="plot_daily_profile", axis="y",
+    )
+
+    # Strict empty-data guard: never render a silent empty plot. Caller
+    # is responsible for upstream filtering / coverage-checking; helper
+    # fails fast if the inputs would produce nothing to plot. Same
+    # contract shape as the L3 unit assertion above -- caller declares
+    # intent (via plot_var and optional project_id) and helper rejects
+    # when intent doesn't match reality.
+    if df_normalized_dt[plot_var].notna().sum() == 0:
+        raise ValueError(
+            f"plot_daily_profile: no non-NA rows for plot_var={plot_var!r} "
+            f"in the input. Check coverage upstream and skip the call."
+        )
+    if project_id is not None:
+        proj_mask = df_normalized_dt["ProjectIdBSV"] == project_id
+        if df_normalized_dt.loc[proj_mask, plot_var].notna().sum() == 0:
+            raise ValueError(
+                f"plot_daily_profile: no non-NA rows for plot_var={plot_var!r} "
+                f"and project_id={project_id!r}. Check coverage and skip the "
+                f"call for this project."
             )
-            interval = infer_interval_from_readingdate(df_normalized_dt)
-            df_normalized_dt[plot_var] = convert_diff_to_power(
-                df_normalized_dt[plot_var], interval
-            )
-            converted_unit = "kW"
-        except Exception:
-            # If the interval can't be inferred or the conversion fails,
-            # fall through to plotting raw values; the y-label will
-            # reflect the unconverted data via axis_label_with_unit.
-            converted_unit = None
 
     grouped = df_normalized_dt.groupby(["ProjectIdBSV", "time_of_day"])[plot_var]
     stats = ["mean", "median", "min", "max"]
@@ -308,14 +479,12 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
         label="mean",
     )
 
-    # When no specific var-name for the axis is defined, derive it from
-    # etdmap unit metadata. For Diff columns we converted to kW above,
-    # so the label reflects that instead of the raw kWh-per-interval.
-    if plot_var_name is None:
-        if converted_unit:
-            plot_var_name = f"{plot_var} ({converted_unit})"
-        else:
-            plot_var_name = axis_label_with_unit(plot_var)
+    # Strict label resolution: data-model unit or caller's overrides.
+    # The Layer-3 assertion above has already verified the unit is in
+    # an accepted class; this just composes the label.
+    plot_var_name = axis_label_with_unit(
+        plot_var, plot_var_name, overrides=overrides,
+    )
 
     # Axis labels and formatting
     ax.set_ylabel(plot_var_name, color="purple")
@@ -345,22 +514,160 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
         return fig
 
 
+def plot_daily_profile_bands(
+        df: pd.DataFrame,
+        plot_var: str,
+        title: Optional[str] = None,
+        plot_var_name: Optional[str] = None,
+        project_id: Optional[int | str] = None,
+        overrides: Optional[dict] = None,
+        save_fig_path: Optional[str] = None,
+        convert_from_energy_per_interval: "pd.Timedelta | str | None" = None,
+):
+    """
+    Band-style daily profile (companion to ``plot_daily_profile``).
+
+    Shows the same 24-hour-of-day shape, but with the canonical 4-layer
+    band stack used by ``plot_weekly_profile`` / ``plot_annual_profile``
+    -- min-max, p01-p99, p25-p75, median line, mean line. No per-stat
+    line breakdown (use ``plot_daily_profile`` for that, kept side by
+    side for callers that want the per-project stat lines).
+
+    Both helpers share the same input contract, unit conventions, and
+    strict empty-data guard. Use ``plot_daily_profile`` when you want
+    to see each statistic as its own line; use this when you want the
+    weekly / annual layout for visual consistency.
+
+    Strict-unit handling: ``plot_var`` must resolve to an instantaneous
+    unit class. Pass ``convert_from_energy_per_interval=<pd.Timedelta>``
+    for the kWh -> kW opt-in. Same shape as the other profile helpers.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with a 'ReadingDate' datetime column and the
+        ``plot_var`` column.
+    plot_var : str
+        Column to render on the y-axis.
+    title : str, optional
+        Composed by the caller (verbatim render). Defaults to
+        ``"Daily profile (bands): {plot_var_name}"``.
+    plot_var_name : str, optional
+        Y-axis label. Defaults to ``plot_var``.
+    project_id : int or str, optional
+        When provided, filters df to that project before grouping by
+        hour-of-day.
+    overrides : dict, optional
+        Per-call ``{col: unit}`` -- forwarded to ``resolve_unit`` /
+        ``axis_label_with_unit``.
+    save_fig_path : str, optional
+        File path. If None, returns the figure.
+    convert_from_energy_per_interval : pd.Timedelta or str, optional
+        Opt-in energy-per-interval -> power conversion. See
+        ``plot_daily_profile`` for the full contract.
+
+    Returns
+    -------
+    matplotlib.figure.Figure or None
+    """
+    if project_id is not None:
+        df = df[df["ProjectIdBSV"] == project_id].copy()
+    if plot_var_name is None:
+        plot_var_name = plot_var
+
+    df = df.copy()
+    # Strict empty-data guard -- mirrors plot_weekly_profile.
+    if df[plot_var].notna().sum() == 0:
+        raise ValueError(
+            f"plot_daily_profile_bands: no non-NA rows for plot_var={plot_var!r}"
+            f"{f' and project_id={project_id!r}' if project_id is not None else ''}. "
+            f"Check coverage upstream and skip the call."
+        )
+
+    # Optional caller-declared energy-per-interval -> power conversion.
+    from etdanalyze.units import (
+        assert_unit_in_classes,
+        apply_optional_energy_conversion,
+    )
+    df, plot_var, overrides = apply_optional_energy_conversion(
+        df, plot_var, convert_from_energy_per_interval,
+        overrides, plot_type="plot_daily_profile_bands",
+    )
+
+    df["hour_of_day"] = df["ReadingDate"].dt.hour
+    grouped = df.groupby("hour_of_day")[plot_var]
+    summary = grouped.agg(["mean", "min", "max"]).reset_index()
+    summary["p01"] = grouped.quantile(0.01).values
+    summary["p25"] = grouped.quantile(0.25).values
+    summary["p75"] = grouped.quantile(0.75).values
+    summary["p99"] = grouped.quantile(0.99).values
+    summary["median"] = grouped.median().values
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    # Canonical 4-layer band stack -- see plot_weekly_profile.
+    ax.fill_between(summary["hour_of_day"], summary["min"], summary["max"],
+                    alpha=0.10, color="steelblue", label="min-max")
+    ax.fill_between(summary["hour_of_day"], summary["p01"], summary["p99"],
+                    alpha=0.18, color="steelblue", label="p01-p99")
+    ax.fill_between(summary["hour_of_day"], summary["p25"], summary["p75"],
+                    alpha=0.30, color="steelblue", label="p25-p75")
+    ax.plot(summary["hour_of_day"], summary["median"],
+            linewidth=0.9, color="steelblue", alpha=0.7, label="median")
+    ax.plot(summary["hour_of_day"], summary["mean"],
+            linewidth=2, color="purple", label="mean")
+
+    # Layer 3 strict-unit assertion -- same accepted classes as the
+    # other profile helpers.
+    _unit = resolve_unit(plot_var, overrides=overrides)
+    assert_unit_in_classes(
+        _unit, plot_var,
+        accepted_classes={"power", "power_per_area", "temperature",
+                          "flow_rate", "state", "ratio",
+                          "volume_per_interval"},
+        plot_type="plot_daily_profile_bands", axis="y",
+    )
+
+    ax.set_xlabel("Hour of day")
+    ax.set_ylabel(axis_label_with_unit(plot_var, plot_var_name, overrides=overrides))
+    ax.set_xticks(range(0, 24, 2))
+    ax.set_xticklabels([f"{h:02d}:00" for h in range(0, 24, 2)])
+    ax.legend()
+    plt.title(title or f"Daily profile (bands): {plot_var_name}")
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+
+    if save_fig_path:
+        fig.savefig(save_fig_path, dpi=300)
+        print(f"Saved plot to {save_fig_path}")
+        plt.close(fig)
+    else:
+        return fig
+
+
 def plot_daily_profile_mean_combined(
         df: pd.DataFrame,
         plot_vars: list[str],
-        title: str="Variabelen per 100m2 (kW)",
-        plot_var_names: Optional[list[str]]=None,
-        y_label: Optional[str]=None,
-        project_id: Optional[str|int]=None,
-        save_fig_path: Optional[str]=None,
-
-        ):
+        title: Optional[str] = None,
+        plot_var_names: Optional[list[str]] = None,
+        y_label: Optional[str] = None,
+        project_id: Optional[str|int] = None,
+        overrides: Optional[dict] = None,
+        save_fig_path: Optional[str] = None,
+):
     """
     Plot the mean values of multiple variables over time for a specific project (if provided).
 
-    This function visualizes the average time-of-day patterns for multiple variables within a dataset.
-    If a `project_id` is provided, it filters the data to only plot that specific project.
-    The plot can either be displayed or saved to a specified file path.
+    For ``*Diff`` columns the per-row energy is converted to average power
+    (kW) via :func:`etdanalyze.units.convert_diff_to_power`. When any Diff
+    conversion ran the default y-label is "kW"; otherwise the first
+    variable's data-model unit is used. The caller may always override the
+    label and title explicitly.
+
+    Note: this function does not divide values by floor area. If the
+    caller has pre-divided the input series to produce a per-m2 quantity
+    they should pass ``y_label`` to reflect that. (The previous default
+    title ``"Variabelen per 100m2 (kW)"`` was misleading -- the function
+    never enforced that scaling.)
 
     Parameters
     ----------
@@ -370,62 +677,58 @@ def plot_daily_profile_mean_combined(
     plot_vars : list of str
         List of column names in `df` representing the variables to plot.
     title : str, optional
-        Title of the plot. Default is "Variabelen per 100m2 (kW)".
+        Plot title. When omitted, derived from the first variable.
     plot_var_names : list of str, optional
         Custom display names for the variables in the legend. If not provided,
         the original column names from `plot_vars` will be used.
+    y_label : str, optional
+        Explicit y-axis label. Use this when the caller has pre-applied a
+        transformation (e.g. per-m2 normalisation) that the helper cannot
+        infer from the column name.
     project_id : int or str, optional
         Identifier of the project to filter the data. If `None`, all data is plotted.
     save_fig_path : str, optional
-        File path to save the plot. If provided, the plot will be saved to this path.
-        If not provided, the function returns the figure object.
+        File path to save the plot.
 
     Returns
     -------
     matplotlib.figure.Figure or None
-        Returns the figure object if `save_fig_path` is not provided. Otherwise, saves the plot
-        to the specified path and returns `None`.
-
-    Notes
-    -----
-    - Ensure `plot_vars` contains valid columns in `df`.
-    - Uses `pd.to_datetime` to parse "time_of_day" for proper time-based plotting.
-    - If `plot_var_names` is not provided, original column names are used for the legend.
-
-    Examples
-    --------
-    >>> plot_daily_profile_combined(
-    ...     df=data,
-    ...     plot_vars=["ElectricityUsage", "SolarOutput"],
-    ...     title="Daily Profile",
-    ...     plot_var_names=["Electricity (kW)", "Solar Power (kW)"],
-    ...     project_id=101,
-    ...     save_fig_path="daily_profile.png"
-    ... )
-    Saved plot to daily_profile.png
     """
     # add time_of_day column that sets the times correctly.
     df = etdtransform.calculated_columns.add_normalized_datetime(df).copy()
 
-    # For Diff columns, convert per-row energy to average power (kW) so
-    # the overlay reads naturally as a power profile. Mixed Diff and
-    # non-Diff in the same call is allowed; each variable is converted
-    # individually if applicable.
-    converted_any = False
-    if "ReadingDate" in df.columns:
-        try:
-            from etdanalyze.units import (
-                infer_interval_from_readingdate,
-                convert_diff_to_power,
-            )
-            interval = infer_interval_from_readingdate(df)
-        except Exception:
-            interval = None
-        if interval is not None:
-            for var in plot_vars:
-                if var in df.columns and var.endswith("Diff"):
-                    df[var] = convert_diff_to_power(df[var], interval)
-                    converted_any = True
+    # Strict empty-data guard. The combined view needs at least ONE
+    # plot_var with data; if every requested variable is all-NA in df
+    # the plot would be empty axes.
+    plot_vars_with_data = [
+        v for v in plot_vars
+        if v in df.columns and df[v].notna().any()
+    ]
+    if not plot_vars_with_data:
+        raise ValueError(
+            f"plot_daily_profile_mean_combined: none of plot_vars={plot_vars!r} "
+            f"have non-NA rows in df"
+            f"{f' (project_id={project_id!r})' if project_id is not None else ''}. "
+            f"Check coverage upstream and skip the call."
+        )
+
+    # Layer 3 strict-unit assertion (per variable). A combined daily
+    # profile reads as a stacked instantaneous view; energy-per-
+    # interval is rejected here for the same reason as in
+    # plot_daily_profile -- callers convert upstream and declare the
+    # resulting power unit via ``overrides``.
+    from etdanalyze.units import assert_unit_in_classes
+    for var in plot_vars:
+        if var not in df.columns:
+            continue
+        unit = resolve_unit(var, overrides=overrides)
+        assert_unit_in_classes(
+            unit, var,
+            accepted_classes={"power", "temperature", "flow_rate", "state",
+                              "ratio", "volume_per_interval"},
+            plot_type="plot_daily_profile_mean_combined", axis="y",
+        )
+    converted_units: dict = {}
 
     fig, ax = plt.subplots(figsize=(16, 12))
     colors = [plt.cm.viridis_r(i / (len(plot_vars))) for i in range(len(plot_vars))]  # Assign distinct colors
@@ -452,15 +755,16 @@ def plot_daily_profile_mean_combined(
         )
 
     ax.set_xlabel("Tijd")
-    # y-label: caller override > derived from first plot_var (or "kW" if any
-    # Diff was converted) > legacy fallback "Variabelen per 100m2 (kW)".
+    # y-label: caller override wins; otherwise look up the first variable's
+    # unit (using its converted unit if Diff conversion ran). Mixing
+    # variables with different units in one plot is the caller's call --
+    # we label by the first one only.
     if y_label is None:
-        if converted_any:
-            y_label = "Variabelen (kW)"
-        elif plot_vars:
-            y_label = axis_label_with_unit(plot_vars[0])
-        else:
-            y_label = "Variabelen per 100m2 (kW)"
+        if not plot_vars:
+            raise ValueError("plot_daily_profile_mean_combined: plot_vars is empty.")
+        first = plot_vars[0]
+        first_overrides = {first: converted_units[first]} if first in converted_units else None
+        y_label = axis_label_with_unit(first, overrides=first_overrides)
     ax.set_ylabel(y_label)
     ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
@@ -486,7 +790,9 @@ def plot_weekly_profile(
         title: Optional[str] = None,
         plot_var_name: Optional[str] = None,
         project_id: Optional[int | str] = None,
+        overrides: Optional[dict] = None,
         save_fig_path: Optional[str] = None,
+        convert_from_energy_per_interval: "pd.Timedelta | str | None" = None,
 ):
     """
     Plot the weekly profile (weekprofiel) for a variable.
@@ -494,6 +800,13 @@ def plot_weekly_profile(
     Shows mean values for each (day-of-week, hour-of-day) combination,
     producing 168 data points across 7 day panels on a single x-axis.
     Min/p25/median/p75/max bands are shown as shading and thin lines.
+
+    Strict-unit handling: ``plot_var`` must resolve to an instantaneous
+    unit class (power / temperature / flow_rate / state / ratio /
+    volume_per_interval). Pass ``convert_from_energy_per_interval=
+    <pd.Timedelta>`` to opt-in to energy-per-interval -> power
+    conversion via the shared helper -- see ``plot_daily_profile`` for
+    the full contract.
 
     Parameters
     ----------
@@ -509,6 +822,9 @@ def plot_weekly_profile(
         When provided, filters df to that project.
     save_fig_path : str, optional
         File path to save the figure. If None, the figure is returned.
+    convert_from_energy_per_interval : pd.Timedelta or str, optional
+        Opt-in energy-per-interval -> mean-power conversion. See
+        ``plot_daily_profile`` for the full contract.
 
     Returns
     -------
@@ -520,21 +836,50 @@ def plot_weekly_profile(
         plot_var_name = plot_var
 
     df = df.copy()
+    # Strict empty-data guard. The project_id filter has already run --
+    # an empty post-filter df means this (var, project) combination has
+    # no data and the caller should have skipped the call upstream.
+    if df[plot_var].notna().sum() == 0:
+        raise ValueError(
+            f"plot_weekly_profile: no non-NA rows for plot_var={plot_var!r}"
+            f"{f' and project_id={project_id!r}' if project_id is not None else ''}. "
+            f"Check coverage upstream and skip the call."
+        )
+
+    # Optional caller-declared energy-per-interval -> power conversion.
+    from etdanalyze.units import (
+        assert_unit_in_classes,
+        apply_optional_energy_conversion,
+    )
+    df, plot_var, overrides = apply_optional_energy_conversion(
+        df, plot_var, convert_from_energy_per_interval,
+        overrides, plot_type="plot_weekly_profile",
+    )
+
     df["day_of_week"] = df["ReadingDate"].dt.dayofweek   # 0=Mon, 6=Sun
     df["hour_of_day"] = df["ReadingDate"].dt.hour
     df["week_slot"] = df["day_of_week"] * 24 + df["hour_of_day"]
 
     grouped = df.groupby("week_slot")[plot_var]
     summary = grouped.agg(["mean", "min", "max"]).reset_index()
+    summary["p01"] = grouped.quantile(0.01).values
     summary["p25"] = grouped.quantile(0.25).values
     summary["p75"] = grouped.quantile(0.75).values
+    summary["p99"] = grouped.quantile(0.99).values
     summary["median"] = grouped.median().values
 
     fig, ax = plt.subplots(figsize=(16, 6))
+    # Canonical 4-layer band stack (ADR-002 / Group B):
+    # min-max (lightest) > p01-p99 > p25-p75 (darkest), then median +
+    # mean lines on top. Same colour, varying alpha so the visual
+    # hierarchy reads from "outliers" to "typical" without legend
+    # reference.
     ax.fill_between(summary["week_slot"], summary["min"], summary["max"],
-                    alpha=0.12, color="steelblue", label="min-max")
+                    alpha=0.10, color="steelblue", label="min-max")
+    ax.fill_between(summary["week_slot"], summary["p01"], summary["p99"],
+                    alpha=0.18, color="steelblue", label="p01-p99")
     ax.fill_between(summary["week_slot"], summary["p25"], summary["p75"],
-                    alpha=0.25, color="steelblue", label="p25-p75")
+                    alpha=0.30, color="steelblue", label="p25-p75")
     ax.plot(summary["week_slot"], summary["median"],
             linewidth=0.9, color="steelblue", alpha=0.7, label="median")
     ax.plot(summary["week_slot"], summary["mean"],
@@ -544,8 +889,19 @@ def plot_weekly_profile(
     for day in range(7):
         ax.axvline(day * 24, color="gray", linewidth=0.5, linestyle="--")
 
+    # Layer 3 strict-unit assertion -- same expectations as
+    # plot_daily_profile: a weekly profile's y-axis reads as an
+    # instantaneous value at each (day, hour) cell.
+    _unit = resolve_unit(plot_var, overrides=overrides)
+    assert_unit_in_classes(
+        _unit, plot_var,
+        accepted_classes={"power", "power_per_area", "temperature",
+                          "flow_rate", "state", "ratio",
+                          "volume_per_interval"},
+        plot_type="plot_weekly_profile", axis="y",
+    )
     ax.set_xlabel("Day of week / hour")
-    ax.set_ylabel(plot_var_name)
+    ax.set_ylabel(axis_label_with_unit(plot_var, plot_var_name, overrides=overrides))
     ax.xaxis.set_major_locator(mticker.MultipleLocator(24))
     ax.xaxis.set_major_formatter(mticker.FuncFormatter(
         lambda x, _: day_names[int(x // 24)] if 0 <= int(x // 24) < 7 else ""
@@ -569,13 +925,20 @@ def plot_annual_profile(
         title: Optional[str] = None,
         plot_var_name: Optional[str] = None,
         project_id: Optional[int | str] = None,
+        overrides: Optional[dict] = None,
         save_fig_path: Optional[str] = None,
+        convert_from_energy_per_interval: "pd.Timedelta | str | None" = None,
 ):
     """
     Plot the annual profile (jaarprofiel) for a variable.
 
-    Shows mean and p25–p75 band for each day-of-year (1–366),
+    Shows mean and p25-p75 band for each day-of-year (1-366),
     revealing seasonal patterns across the year.
+
+    Strict-unit handling: ``plot_var`` must resolve to an instantaneous
+    unit class. Pass ``convert_from_energy_per_interval=<pd.Timedelta>``
+    to opt-in to energy-per-interval -> power conversion via the
+    shared helper -- see ``plot_daily_profile`` for the full contract.
 
     Parameters
     ----------
@@ -591,6 +954,9 @@ def plot_annual_profile(
         When provided, filters df to that project.
     save_fig_path : str, optional
         File path to save the figure. If None, the figure is returned.
+    convert_from_energy_per_interval : pd.Timedelta or str, optional
+        Opt-in energy-per-interval -> mean-power conversion. See
+        ``plot_daily_profile`` for the full contract.
 
     Returns
     -------
@@ -602,18 +968,45 @@ def plot_annual_profile(
         plot_var_name = plot_var
 
     df = df.copy()
+    # Strict empty-data guard -- see plot_weekly_profile for the contract.
+    if df[plot_var].notna().sum() == 0:
+        raise ValueError(
+            f"plot_annual_profile: no non-NA rows for plot_var={plot_var!r}"
+            f"{f' and project_id={project_id!r}' if project_id is not None else ''}. "
+            f"Check coverage upstream and skip the call."
+        )
+
+    # Optional caller-declared energy-per-interval -> power conversion.
+    from etdanalyze.units import (
+        assert_unit_in_classes,
+        apply_optional_energy_conversion,
+    )
+    df, plot_var, overrides = apply_optional_energy_conversion(
+        df, plot_var, convert_from_energy_per_interval,
+        overrides, plot_type="plot_annual_profile",
+    )
     df["day_of_year"] = df["ReadingDate"].dt.dayofyear
 
     grouped = df.groupby("day_of_year")[plot_var]
-    summary = grouped.mean().reset_index(name="mean")
+    summary = grouped.agg(["mean", "min", "max"]).reset_index()
+    summary["p01"] = grouped.quantile(0.01).values
     summary["p25"] = grouped.quantile(0.25).values
     summary["p75"] = grouped.quantile(0.75).values
+    summary["p99"] = grouped.quantile(0.99).values
+    summary["median"] = grouped.median().values
 
     fig, ax = plt.subplots(figsize=(16, 6))
+    # Canonical 4-layer band stack -- see plot_weekly_profile.
+    ax.fill_between(summary["day_of_year"], summary["min"], summary["max"],
+                    alpha=0.10, color="steelblue", label="min-max")
+    ax.fill_between(summary["day_of_year"], summary["p01"], summary["p99"],
+                    alpha=0.18, color="steelblue", label="p01-p99")
     ax.fill_between(summary["day_of_year"], summary["p25"], summary["p75"],
-                    alpha=0.25, color="steelblue", label="p25-p75")
+                    alpha=0.30, color="steelblue", label="p25-p75")
+    ax.plot(summary["day_of_year"], summary["median"],
+            linewidth=0.9, color="steelblue", alpha=0.7, label="median")
     ax.plot(summary["day_of_year"], summary["mean"],
-            linewidth=1.5, color="purple", label="mean")
+            linewidth=2, color="purple", label="mean")
 
     month_starts = [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
     month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -622,8 +1015,18 @@ def plot_annual_profile(
         ax.axvline(start, color="gray", linewidth=0.4, linestyle="--")
         ax.text(start + 0.5, ax.get_ylim()[1], name, fontsize=7, color="gray", va="top")
 
+    # Layer 3 strict-unit assertion -- annual profile reads as an
+    # instantaneous value at each day-of-year position.
+    _unit = resolve_unit(plot_var, overrides=overrides)
+    assert_unit_in_classes(
+        _unit, plot_var,
+        accepted_classes={"power", "power_per_area", "temperature",
+                          "flow_rate", "state", "ratio",
+                          "volume_per_interval"},
+        plot_type="plot_annual_profile", axis="y",
+    )
     ax.set_xlabel("Day of year")
-    ax.set_ylabel(plot_var_name)
+    ax.set_ylabel(axis_label_with_unit(plot_var, plot_var_name, overrides=overrides))
     ax.legend()
     plt.title(title or f"Annual profile: {plot_var_name}")
     plt.grid(True, alpha=0.4)
@@ -681,13 +1084,30 @@ def plot_cop_vs_temp(
         temp_col: str = "TemperatuurBuitenWarmtepomp",
         title: Optional[str] = None,
         project_id: Optional[int | str] = None,
+        overrides: Optional[dict] = None,
         save_fig_path: Optional[str] = None,
+        alpha: float = 0.4,
+        y_clip: Optional[tuple] = None,
 ):
     """
     Scatter plot of daily average COP against outdoor temperature.
 
     Each point represents one day. Requires daily-aggregated input
     (compute daily means before calling).
+
+    The ``alpha`` parameter controls per-point opacity (default 0.4,
+    matching the original per-project rendering). For dense pooled
+    views (whole-dataset, all households x all days = 10k+ points)
+    pass a low value (e.g. ``alpha=0.08``) so overplot density
+    reveals cloud shape without hiding outliers via aggregation
+    (MW100 strict-disaggregation approach).
+
+    ``y_clip=(ymin, ymax)`` sets ``ax.set_ylim`` *only* -- impossible
+    COP outliers (divide-by-near-zero artifacts on mostly-standby
+    days) are kept in the data and in the OLS-trend computation; they
+    are just visually clipped to keep the physically-plausible cloud
+    readable. If the trend ends up flat-with-R^2=0, that is a real
+    signal that outliers dominate.
 
     Parameters
     ----------
@@ -712,13 +1132,60 @@ def plot_cop_vs_temp(
         df = df[df["ProjectIdBSV"] == project_id].copy()
 
     plot_df = df[[temp_col, cop_col]].dropna()
+    # Strict empty-data guard. The scatter is useless without paired
+    # (temp, cop) observations; caller is responsible for checking
+    # coverage upstream (e.g. via classify_coverage) and skipping the
+    # call when none exist. Today's silent-empty-scatter behaviour
+    # (visible in the project 1 / 8 cop_vs_temp PNGs) is what this
+    # contract surfaces loudly.
+    if plot_df.empty:
+        raise ValueError(
+            f"plot_cop_vs_temp: no rows with both temp_col={temp_col!r} "
+            f"and cop_col={cop_col!r} non-NA"
+            f"{f' for project_id={project_id!r}' if project_id is not None else ''}. "
+            f"Check coverage upstream and skip the call."
+        )
 
     fig, ax = plt.subplots(figsize=(10, 7))
     ax.scatter(plot_df[temp_col], plot_df[cop_col],
-               alpha=0.4, s=20, color="steelblue", label="dagelijks")
-    _ols_overlay(ax, plot_df[temp_col], plot_df[cop_col], label="OLS-trend")
-    ax.set_xlabel(f"Outdoor temperature (°C) [{temp_col}]")
-    ax.set_ylabel(f"COP [{cop_col}]")
+               alpha=alpha, s=20, color="steelblue", label="dagelijks")
+    # OLS trend: when y_clip is set, compute on data within the
+    # visible band so the trend reflects the physically-plausible
+    # cloud the reader can see. Without this, impossible-COP outliers
+    # (visually clipped above the y-axis) still dominate the OLS and
+    # produce a flat line with R^2=0 that is unhelpful for the
+    # visible population. Outliers remain in the scatter (just clipped
+    # visually); we do not hide them, we just don't let them drag the
+    # trend line.
+    if y_clip is not None:
+        trend_df = plot_df[
+            (plot_df[cop_col] >= y_clip[0])
+            & (plot_df[cop_col] <= y_clip[1])
+        ]
+    else:
+        trend_df = plot_df
+    if len(trend_df) >= 2:
+        _ols_overlay(ax, trend_df[temp_col], trend_df[cop_col], label="OLS-trend")
+    # Layer 3 strict-unit assertions -- COP is dimensionless (ratio);
+    # outdoor temp is a temperature.
+    from etdanalyze.units import assert_unit_in_classes
+    assert_unit_in_classes(
+        resolve_unit(cop_col, overrides=overrides), cop_col,
+        accepted_classes={"ratio"},
+        plot_type="plot_cop_vs_temp", axis="y",
+    )
+    assert_unit_in_classes(
+        resolve_unit(temp_col, overrides=overrides), temp_col,
+        accepted_classes={"temperature"},
+        plot_type="plot_cop_vs_temp", axis="x",
+    )
+    ax.set_xlabel(axis_label_with_unit(temp_col,
+                                       base_label=f"Outdoor temperature [{temp_col}]",
+                                       overrides=overrides))
+    ax.set_ylabel(axis_label_with_unit(cop_col, base_label=f"COP [{cop_col}]",
+                                       overrides=overrides))
+    if y_clip is not None:
+        ax.set_ylim(*y_clip)
     plt.title(title or "COP vs outdoor temperature")
     plt.grid(True, alpha=0.4)
     plt.tight_layout()
@@ -738,6 +1205,7 @@ def plot_cop_vs_delta_t(
         outdoor_temp_col: str = "TemperatuurBuitenWarmtepomp",
         title: Optional[str] = None,
         project_id: Optional[int | str] = None,
+        overrides: Optional[dict] = None,
         save_fig_path: Optional[str] = None,
 ):
     """
@@ -774,13 +1242,40 @@ def plot_cop_vs_delta_t(
     df = df.copy()
     df["delta_T"] = df[supply_temp_col] - df[outdoor_temp_col]
     plot_df = df[["delta_T", cop_col]].dropna()
+    # Strict empty-data guard -- see plot_cop_vs_temp for the contract.
+    if plot_df.empty:
+        raise ValueError(
+            f"plot_cop_vs_delta_t: no rows with non-NA cop_col={cop_col!r} "
+            f"and valid delta_T (from {supply_temp_col!r} - {outdoor_temp_col!r})"
+            f"{f' for project_id={project_id!r}' if project_id is not None else ''}. "
+            f"Check coverage upstream and skip the call."
+        )
 
     fig, ax = plt.subplots(figsize=(10, 7))
     ax.scatter(plot_df["delta_T"], plot_df[cop_col],
                alpha=0.4, s=20, color="steelblue", label="dagelijks")
     _ols_overlay(ax, plot_df["delta_T"], plot_df[cop_col], label="OLS-trend")
-    ax.set_xlabel(f"Temperature lift dT (degC)  [{supply_temp_col} - {outdoor_temp_col}]")
-    ax.set_ylabel(f"COP [{cop_col}]")
+    # Layer 3 strict-unit assertions -- delta_T is a temperature
+    # difference (same class as a temperature); COP is dimensionless.
+    from etdanalyze.units import assert_unit_in_classes
+    assert_unit_in_classes(
+        resolve_unit(cop_col, overrides=overrides), cop_col,
+        accepted_classes={"ratio"},
+        plot_type="plot_cop_vs_delta_t", axis="y",
+    )
+    assert_unit_in_classes(
+        resolve_unit("delta_T", overrides=overrides), "delta_T",
+        accepted_classes={"temperature"},
+        plot_type="plot_cop_vs_delta_t", axis="x",
+    )
+    ax.set_xlabel(axis_label_with_unit(
+        "delta_T",
+        base_label=f"Temperature lift dT [{supply_temp_col} - {outdoor_temp_col}]",
+        overrides=overrides,
+    ))
+    ax.set_ylabel(axis_label_with_unit(
+        cop_col, base_label=f"COP [{cop_col}]", overrides=overrides,
+    ))
     plt.title(title or "COP vs temperature lift (dT)")
     plt.grid(True, alpha=0.4)
     plt.tight_layout()
@@ -801,6 +1296,7 @@ def plot_energy_signature(
         title: Optional[str] = None,
         energy_label: Optional[str] = None,
         project_id: Optional[int | str] = None,
+        overrides: Optional[dict] = None,
         save_fig_path: Optional[str] = None,
 ):
     """
@@ -835,10 +1331,34 @@ def plot_energy_signature(
     """
     if project_id is not None:
         df = df[df["ProjectIdBSV"] == project_id].copy()
+    # Layer 3 strict-unit assertions -- energy signature plots
+    # energy- or power-per-area on the y-axis against temperature
+    # on the x-axis.
+    from etdanalyze.units import assert_unit_in_classes
+    assert_unit_in_classes(
+        resolve_unit(energy_col, overrides=overrides), energy_col,
+        accepted_classes={"power_per_area", "energy_per_area"},
+        plot_type="plot_energy_signature", axis="y",
+    )
+    assert_unit_in_classes(
+        resolve_unit(temp_col, overrides=overrides), temp_col,
+        accepted_classes={"temperature"},
+        plot_type="plot_energy_signature", axis="x",
+    )
     if energy_label is None:
-        energy_label = energy_col
+        energy_label = axis_label_with_unit(energy_col, overrides=overrides)
 
     plot_df = df[[temp_col, energy_col]].dropna()
+    # Strict empty-data guard. An energy-signature scatter needs paired
+    # (temp, energy) observations to be meaningful; raise loudly when
+    # the caller's project / variable selection produced none.
+    if plot_df.empty:
+        raise ValueError(
+            f"plot_energy_signature: no rows with both temp_col={temp_col!r} "
+            f"and energy_col={energy_col!r} non-NA"
+            f"{f' for project_id={project_id!r}' if project_id is not None else ''}. "
+            f"Check coverage upstream and skip the call."
+        )
 
     fig, ax = plt.subplots(figsize=(10, 7))
     ax.scatter(plot_df[temp_col], plot_df[energy_col],
@@ -859,11 +1379,16 @@ def plot_energy_signature(
         if fit.get("stookgrens") is not None:
             sg = fit["stookgrens"]
             ax.axvline(sg, color="gray", linewidth=1, linestyle=":")
+            # Stookgrens unit follows the x-axis temperature column.
+            # Use resolve_unit so derived temp_col gets the same strict
+            # treatment as the axis label (no silent empty unit).
             ax.text(sg + 0.2, ax.get_ylim()[0],
-                    f"Stookgrens\n{sg:.1f}degC",
+                    f"Stookgrens\n{sg:.1f} {resolve_unit(temp_col, overrides=overrides)}",
                     fontsize=8, color="gray", va="bottom")
 
-    ax.set_xlabel(f"Outdoor temperature (°C) [{temp_col}]")
+    ax.set_xlabel(axis_label_with_unit(temp_col,
+                                       base_label=f"Outdoor temperature [{temp_col}]",
+                                       overrides=overrides))
     ax.set_ylabel(energy_label)
     ax.legend()
     plt.title(title or "Energy signature")
@@ -883,7 +1408,9 @@ def plot_monthly_profile(
         plot_var: str,
         title: Optional[str] = None,
         plot_var_name: Optional[str] = None,
+        overrides: Optional[dict] = None,
         save_fig_path: Optional[str] = None,
+        convert_from_energy_per_interval: "pd.Timedelta | str | None" = None,
 ):
     """
     Plot the monthly profile (maandprofiel) as a heatmap: 12 months x 24 hours = 288 slots.
@@ -891,6 +1418,11 @@ def plot_monthly_profile(
     Each cell shows the mean value of plot_var for that (month, hour-of-day) combination,
     aggregated over all rows in df. The heatmap is compact and directly comparable across
     variables and domains.
+
+    Strict-unit handling: ``plot_var`` must resolve to an instantaneous
+    unit class. Pass ``convert_from_energy_per_interval=<pd.Timedelta>``
+    to opt-in to energy-per-interval -> power conversion via the
+    shared helper -- see ``plot_daily_profile`` for the full contract.
 
     Parameters
     ----------
@@ -904,6 +1436,9 @@ def plot_monthly_profile(
         Colorbar label and title suffix. Defaults to plot_var.
     save_fig_path : str, optional
         File path to save the figure. If None, the figure is returned.
+    convert_from_energy_per_interval : pd.Timedelta or str, optional
+        Opt-in energy-per-interval -> mean-power conversion. See
+        ``plot_daily_profile`` for the full contract.
 
     Returns
     -------
@@ -913,6 +1448,24 @@ def plot_monthly_profile(
         plot_var_name = plot_var
 
     df = df.copy()
+    # Strict empty-data guard -- monthly profile has no internal
+    # project_id filter, so the check is just the input itself.
+    if df[plot_var].notna().sum() == 0:
+        raise ValueError(
+            f"plot_monthly_profile: no non-NA rows for plot_var={plot_var!r}. "
+            f"Check coverage upstream and skip the call."
+        )
+
+    # Optional caller-declared energy-per-interval -> power conversion.
+    from etdanalyze.units import (
+        assert_unit_in_classes,
+        apply_optional_energy_conversion,
+    )
+    df, plot_var, overrides = apply_optional_energy_conversion(
+        df, plot_var, convert_from_energy_per_interval,
+        overrides, plot_type="plot_monthly_profile",
+    )
+
     df["month"] = df["ReadingDate"].dt.month
     df["hour_of_day"] = df["ReadingDate"].dt.hour
 
@@ -930,7 +1483,19 @@ def plot_monthly_profile(
         cmap="RdYlBu_r",
         interpolation="nearest",
     )
-    plt.colorbar(im, ax=ax, label=plot_var_name)
+    # Layer 3 strict-unit assertion -- monthly heatmap encodes
+    # variable value via colour. Accepts the same instantaneous
+    # classes as the other profile plots.
+    _unit = resolve_unit(plot_var, overrides=overrides)
+    assert_unit_in_classes(
+        _unit, plot_var,
+        accepted_classes={"power", "power_per_area", "temperature",
+                          "flow_rate", "state", "ratio",
+                          "volume_per_interval"},
+        plot_type="plot_monthly_profile", axis="colorbar",
+    )
+    plt.colorbar(im, ax=ax,
+                 label=axis_label_with_unit(plot_var, plot_var_name, overrides=overrides))
 
     month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -1036,6 +1601,14 @@ def _draw_boxes(
     ax.grid(True, axis="y", alpha=0.3)
 
 
+DEFAULT_BOXWHISKER_TITLE_TPL = (
+    "per-huishouden {value_col}: {variable}{unit_paren} per {x_group}"
+)
+DEFAULT_BOXWHISKER_YLABEL_TPL = (
+    "per-huishouden {value_col} -- {variable}{unit_paren}"
+)
+
+
 def plot_boxwhisker_comparison(
         df: pd.DataFrame,
         value_col: str,
@@ -1044,12 +1617,12 @@ def plot_boxwhisker_comparison(
         *,
         title: Optional[str] = None,
         y_label: Optional[str] = None,
+        title_params: Optional[dict] = None,
+        wrap: bool = True,
         jitter_seed: int = 42,
         save_fig_path: Optional[str] = None,
-        # Optional extensions: unit-aware labels, outlier overlay,
-        # and a stacked secondary axis. All default-None / default-empty
-        # so existing callers see no behaviour change.
         column_name: Optional[str] = None,
+        overrides: Optional[dict] = None,
         outlier_ids: Optional[set] = None,
         id_col: str = "HuisIdBSV",
         secondary_axis_data: Optional[pd.DataFrame] = None,
@@ -1089,13 +1662,45 @@ def plot_boxwhisker_comparison(
         Categorical column for x-axis positioning (e.g. 'ProjectIdBSV').
     color_group : str
         Categorical column for dot colour coding.
-    title, y_label, jitter_seed, save_fig_path :
-        As before.
+    title : str, optional
+        Title TEMPLATE rendered via ``str.format()``. Available
+        placeholders:
+          - ``{variable}``: ``column_name`` if given, else ``value_col``
+          - ``{unit}``: unit string (``""`` if unitless), resolved via
+            ``resolve_unit(column_name, overrides)``
+          - ``{unit_paren}``: convenience -- ``" (unit)"`` if non-empty,
+            ``""`` if unitless. Use this in default-style templates
+            so unitless variables don't render dangling ``()``.
+          - ``{value_col}``, ``{x_group}``: as named.
+          - any keys in ``title_params``.
+        Default: ``"per-huishouden {value_col}: {variable}{unit_paren} per {x_group}"``.
+        STRICT CONTRACT: when ``column_name`` is given the helper owns
+        the unit -- do NOT pre-stamp a unit suffix in the template
+        text. Pre-stamping plus ``{unit_paren}`` produces a visibly
+        doubled unit, which is the loud failure mode by design.
+    y_label : str, optional
+        Y-axis label TEMPLATE. Same placeholders as ``title``.
+        Default: ``"per-huishouden {value_col} -- {variable}{unit_paren}"``.
+    title_params : dict, optional
+        Extra named values for the title / y_label templates (e.g.
+        ``{"period": "year"}`` to enable ``"... - {period}"`` in your
+        template).
+    wrap : bool, default True
+        Wrap the title to the figure width (``ax.set_title(wrap=True)``)
+        and the y-label to a fixed character width via ``textwrap.fill``.
+        Disable only when callers need raw control over line breaks.
     column_name : str, optional
-        ETD model column name. When given, the y_label and title are
-        suffixed with the variable's unit looked up from etdmap
-        thresholds (e.g. ' (kWh)'). Skipped silently if no unit is
-        registered.
+        ETD data model column name (or derived variable when paired
+        with ``overrides``). Drives the ``{variable}`` / ``{unit}`` /
+        ``{unit_paren}`` placeholders.
+    overrides : dict, optional
+        Per-call ``{column_name: unit}`` mapping forwarded to
+        ``resolve_unit``. Required when ``column_name`` is a derived
+        variable not in the etdmap data model (e.g. ``COP_system``,
+        ``ZonopwekBrutoPer100M2KW``). Use ``""`` to mark unitless.
+        The strict ``resolve_unit`` contract is preserved -- absence
+        of a column from BOTH the data model AND ``overrides`` raises
+        ``KeyError`` so missing-unit drift surfaces loudly.
     outlier_ids : set, optional
         If given, the whole-population scatter is replaced with 'x'
         markers showing only the rows whose id_col value is in this
@@ -1120,9 +1725,19 @@ def plot_boxwhisker_comparison(
     if outlier_ids is not None and id_col in df.columns and id_col not in select_cols:
         select_cols = select_cols + [id_col]
     plot_df = df[[c for c in select_cols if c in df.columns]].dropna(subset=[value_col])
+    # Strict empty-data guard: no silent empty plots. Caller is responsible
+    # for upstream coverage filtering; helper fails fast so the missing-data
+    # case surfaces loudly and isn't disguised as a silent return.
     if plot_df.empty:
-        return None
+        raise ValueError(
+            f"plot_boxwhisker_comparison: no non-NA rows for value_col="
+            f"{value_col!r} in the input. Check coverage upstream and skip "
+            f"the call."
+        )
 
+    # Legend honesty: x_cats / c_cats are built from values that actually
+    # survive the dropna above, so a (project, woningtype) combo with no
+    # observations never reaches the legend or the x-axis.
     x_cats = sorted(plot_df[x_group].dropna().unique().tolist(), key=str)
     c_cats = sorted(plot_df[color_group].dropna().unique().tolist(), key=str)
 
@@ -1130,14 +1745,45 @@ def plot_boxwhisker_comparison(
     c_colors = {cat: cmap(i % 10) for i, cat in enumerate(c_cats)}
     rng = np.random.default_rng(jitter_seed)
 
-    # Resolve labels with optional unit lookup
-    effective_y = y_label or value_col
-    effective_title = title or f"{value_col} by {x_group}"
+    # Resolve labels via strict template rendering. Boxplot draws ONE
+    # POINT PER HOUSEHOLD using value_col (typically a per-household
+    # summary statistic like "mean"); reviewers mistakenly read these
+    # plots as distributions of raw values, so the default templates
+    # name the statistic explicitly in both the title and the y-axis.
+    #
+    # Strict-NA-style contract: ``resolve_unit`` is called ONCE per call
+    # (not once per label), and raises ``KeyError`` if column_name is
+    # neither in the data model nor in ``overrides``. There is no
+    # silent-skip guard on the title rendering.
     if column_name:
-        u = unit_for_column(column_name)
-        if u:
-            effective_y = f"{effective_y} ({u})"
-            effective_title = f"{effective_title} ({u})"
+        unit = resolve_unit(column_name, overrides=overrides)
+        variable = column_name
+    else:
+        unit = ""
+        variable = value_col
+    unit_paren = f" ({unit})" if unit else ""
+
+    fmt_params = {
+        "variable":   variable,
+        "unit":       unit,
+        "unit_paren": unit_paren,
+        "value_col":  value_col,
+        "x_group":    x_group,
+        **(title_params or {}),
+    }
+    title_tpl   = title   if title   is not None else DEFAULT_BOXWHISKER_TITLE_TPL
+    y_label_tpl = y_label if y_label is not None else DEFAULT_BOXWHISKER_YLABEL_TPL
+    try:
+        effective_title = title_tpl.format(**fmt_params)
+        effective_y     = y_label_tpl.format(**fmt_params)
+    except KeyError as missing:
+        raise ValueError(
+            f"plot_boxwhisker_comparison: title/y_label template references "
+            f"placeholder {missing!s} which is not in title_params nor in "
+            f"the auto-filled placeholders {{variable}}, {{unit}}, "
+            f"{{unit_paren}}, {{value_col}}, {{x_group}}. Pass it via "
+            f"title_params={{...}}."
+        ) from None
 
     fig_width = max(8.0, len(x_cats) * 1.6 + 2.0)
     has_secondary = (
@@ -1167,12 +1813,20 @@ def plot_boxwhisker_comparison(
         x_cats, c_cats, c_colors, rng, outlier_ids, id_col,
         xtick_prefix=xtick_prefix,
     )
-    ax.set_ylabel(effective_y)
+    # wrap=True is the default; matplotlib's ax.set_title(wrap=True) wraps
+    # to figure width; y-axis labels need textwrap.fill (set_ylabel's
+    # wrap kwarg wraps at the axis boundary which is too narrow for
+    # vertical labels).
+    if wrap:
+        ax.set_ylabel(textwrap.fill(effective_y, width=60, break_long_words=False))
+        ax.set_title(effective_title, wrap=True)
+    else:
+        ax.set_ylabel(effective_y)
+        ax.set_title(effective_title)
     ax.legend(
         title=color_group, bbox_to_anchor=(1.01, 1), loc="upper left",
         borderaxespad=0, fontsize=9,
     )
-    ax.set_title(effective_title)
 
     if ax2 is not None:
         # Companion-metric scatter beneath. Hide redundant tick labels on
@@ -1214,6 +1868,7 @@ def plot_household_range_strips(
     id_col: str = "HuisIdBSV",
     color_group: Optional[str] = "Dataleverancier",
     column_name: Optional[str] = None,
+    overrides: Optional[dict] = None,
     title: Optional[str] = None,
     y_label: Optional[str] = None,
     save_fig_path: Optional[str] = None,
@@ -1256,8 +1911,12 @@ def plot_household_range_strips(
         raise KeyError(f"plot_household_range_strips: missing columns {missing}")
 
     plot_df = df.dropna(subset=["min", "max", "median"]).copy()
+    # Strict empty-data guard -- no silent empty plots.
     if plot_df.empty:
-        return None
+        raise ValueError(
+            "plot_household_range_strips: no rows with non-NA "
+            "min/max/median. Check coverage upstream and skip the call."
+        )
 
     has_q1  = "p01"  in plot_df.columns
     has_q25 = "p25" in plot_df.columns
@@ -1371,9 +2030,10 @@ def plot_household_range_strips(
 
     base_y = y_label or "value per household"
     if column_name:
-        u = unit_for_column(column_name)
-        if u:
-            base_y = f"{base_y} ({u})"
+        # Strict: raises if column_name is in neither the data model nor
+        # `overrides`. No silent fallback, no "(" guard -- callers must
+        # not pre-stamp a unit when passing column_name (helper appends).
+        base_y = axis_label_with_unit(column_name, base_y, overrides=overrides)
     ax.set_ylabel(base_y)
 
     base_title = title or (
@@ -1381,10 +2041,8 @@ def plot_household_range_strips(
         if column_name else "Per-household range strips"
     )
     if column_name:
-        u = unit_for_column(column_name)
-        if u and "(" not in base_title:
-            base_title = f"{base_title} ({u})"
-    ax.set_title(base_title)
+        base_title = axis_label_with_unit(column_name, base_title, overrides=overrides)
+    ax.set_title(base_title, wrap=True)
 
     # Build a legend with one entry per color_group category
     if c_cats:
@@ -1411,12 +2069,16 @@ def plot_household_range_heatmap(
     project_col: str = "ProjectIdBSV",
     id_col: str = "HuisIdBSV",
     column_name: Optional[str] = None,
+    overrides: Optional[dict] = None,
     title: Optional[str] = None,
     y_label: Optional[str] = None,
     save_fig_path: Optional[str] = None,
     xtick_prefix: str = "Proj ",
     n_y_bins: int = 300,
     exclude_last_percentile: bool = False,
+    show_household_ids: bool = False,
+    households_to_label: Optional[object] = None,
+    household_id_fontsize: int = 7,
 ) -> Optional[plt.Figure]:
     """
     Discrete-band per-household range strips: side-by-side columns,
@@ -1449,6 +2111,28 @@ def plot_household_range_heatmap(
         the IQR is squashed to a few pixels. Default False.
     n_y_bins : int, optional
         Vertical resolution. Default 300.
+    show_household_ids : bool, optional
+        When True, draw each household's ``id_col`` value (e.g.
+        ``HuisIdBSV``) horizontally above its bar, with a thin leader
+        line connecting the label to the bar's max. Labels are
+        staggered in two alternating rows so consecutive labels do
+        not overlap horizontally. Use ``households_to_label`` to
+        restrict labelling to a specific subset (e.g. outliers).
+        Default False (off so other callers don't pay the layout
+        adjustment).
+    households_to_label : iterable, optional
+        When provided alongside ``show_household_ids=True``, only
+        households whose ``id_col`` value is in this iterable are
+        labelled. Other households are drawn unlabelled. Useful when
+        the caller has identified a subset of interest (outliers on
+        some statistic, sensors flagged for review, etc.) and wants
+        to call them out without cluttering the plot with all
+        ~400 household ids. Default None (label every household,
+        which is only practical for small cohorts).
+    household_id_fontsize : int, optional
+        Point size for the household-id labels when
+        ``show_household_ids=True``. Default 7 -- horizontal labels
+        at this size are legible without zooming in DOCX exports.
 
     Required columns: ``id_col``, ``project_col``, ``min``, ``max``,
     ``median``, ``p01``, ``p25``, ``p75``,
@@ -1472,8 +2156,13 @@ def plot_household_range_heatmap(
         "min", "max", "median",
         "p01", "p25", "p75", "p99",
     ]).copy()
+    # Strict empty-data guard -- no silent empty heatmaps.
     if plot_df.empty:
-        return None
+        raise ValueError(
+            "plot_household_range_heatmap: no rows with non-NA "
+            "min/max/median/p01/p25/p75/p99. Check coverage upstream "
+            "and skip the call."
+        )
 
     plot_df = plot_df.sort_values([project_col, id_col], kind="stable").reset_index(drop=True)
     n = len(plot_df)
@@ -1527,7 +2216,9 @@ def plot_household_range_heatmap(
     cmap.set_bad(color="white", alpha=0.0)
     norm = BoundaryNorm(boundaries=[0.5, 1.5, 2.5, 3.5], ncolors=cmap.N)
 
-    # Half the previous compact width.
+    # Compact width regardless of show_household_ids -- labels are
+    # placed inside the plot with vertical staggering, so they do not
+    # require extra horizontal real estate.
     fig_width = max(3.0, n * 0.010 + 1.5)
     fig, ax = plt.subplots(figsize=(fig_width, 5), constrained_layout=True)
 
@@ -1576,11 +2267,60 @@ def plot_household_range_heatmap(
     ax.set_ylim(y_lo, y_hi)
     ax.tick_params(axis="y", labelsize=8)
 
+    # Per-household identifier labels: horizontal, staggered above each
+    # household's own bar. Anchored at the household's max value with a
+    # thin leader line connecting label to bar so the association stays
+    # clear when labels are sparse. Two alternating row heights so
+    # consecutive labels (or pairs of labels close in x) do not overlap.
+    # When `households_to_label` is given, only those households are
+    # labelled -- which is the practical mode for cohorts of hundreds.
+    _ids_with_labels: list[int] = []
+    if show_household_ids:
+        ids = plot_df[id_col].astype(str).tolist()
+        if households_to_label is not None:
+            # Normalise to string set for membership test; ids in the
+            # iterable may be int or str.
+            target = {str(x) for x in households_to_label}
+            _ids_with_labels = [i for i in range(n) if ids[i] in target]
+        else:
+            _ids_with_labels = list(range(n))
+
+    if _ids_with_labels:
+        y_range_data = y_hi - y_lo
+        base_offset = y_range_data * 0.03
+        stagger_offset = y_range_data * 0.10
+        for k, i in enumerate(_ids_with_labels):
+            y_anchor = maxs[i] if not np.isnan(maxs[i]) else y_hi
+            # Stagger by labelled-set position k (not absolute i) so
+            # consecutive *labelled* households alternate even when
+            # the labelled set is sparse and irregular.
+            extra = stagger_offset if k % 2 == 1 else 0.0
+            y_pos = y_anchor + base_offset + extra
+            # Thin leader line from bar top to label base so the
+            # mapping bar -> label is unambiguous (especially for the
+            # higher-staggered row).
+            ax.plot(
+                [i, i], [y_anchor, y_pos],
+                color="black", linewidth=0.4, alpha=0.5, zorder=9,
+            )
+            ax.text(
+                i, y_pos, ids[i],
+                rotation=0, fontsize=household_id_fontsize,
+                ha="center", va="bottom",
+                zorder=10,
+            )
+        # Pad top and bottom of the y-axis so the labels are not clipped
+        # by the title (top) or by the project xticks at the bottom.
+        # Only applied when labels are actually being drawn -- the data
+        # band [y_lo, y_hi] is preserved as the area showing the bars,
+        # but the axis itself extends a bit further.
+        ax.set_ylim(y_lo - y_range_data * 0.05, y_hi + y_range_data * 0.20)
+
     base_y = y_label or "value per household"
     if column_name:
-        u = unit_for_column(column_name)
-        if u:
-            base_y = f"{base_y} ({u})"
+        # Strict: raises if column_name is in neither the data model nor
+        # `overrides`. No "(" guard -- callers must not pre-stamp.
+        base_y = axis_label_with_unit(column_name, base_y, overrides=overrides)
     ax.set_ylabel(base_y, fontsize=9)
 
     base_title = title or (
@@ -1588,12 +2328,10 @@ def plot_household_range_heatmap(
         if column_name else "Per-household range bands"
     )
     if column_name:
-        u = unit_for_column(column_name)
-        if u and "(" not in base_title:
-            base_title = f"{base_title} ({u})"
+        base_title = axis_label_with_unit(column_name, base_title, overrides=overrides)
     if exclude_last_percentile:
         base_title = f"{base_title}  (p25..p99 only)"
-    ax.set_title(base_title, fontsize=10)
+    ax.set_title(base_title, fontsize=10, wrap=True)
 
     # Discrete colourbar -- precise labels.
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
@@ -1653,8 +2391,6 @@ def plot_load_duration_curve(
         to the specified path and returns `None`.
     """
     # Filter and sort
-    multiplier = etdtransform.calculated_columns.switch_multiplier(interval)
-
     if filter_upper_lower_bounds:
         filtered_df = analysis_helpers.filter_between_upper_lower_bounds(
             df,
@@ -1663,10 +2399,24 @@ def plot_load_duration_curve(
     else:
         filtered_df = df
 
+    # Strict empty-data guard -- the sort is unhelpful on zero rows.
+    if filtered_df[diff_column].notna().sum() == 0:
+        raise ValueError(
+            f"plot_load_duration_curve: no non-NA rows for diff_column="
+            f"{diff_column!r}"
+            f"{f' (project_id={project_id!r})' if project_id is not None else ''}"
+            f"{' after upper/lower filter' if filter_upper_lower_bounds else ''}. "
+            f"Check coverage upstream and skip the call."
+        )
+
     sorted_values = filtered_df[diff_column].sort_values(ascending=False).reset_index(drop=True)
 
+    # Convert per-row kWh into average power (kW) via the validated helper.
+    # The helper checks that diff_column's data-model unit is kWh and
+    # returns the display unit so the y-axis label stays in sync.
+    from etdanalyze.units import convert_diff_to_power
+    y_data, converted_unit = convert_diff_to_power(sorted_values, diff_column, interval)
     x_data = range(1, len(sorted_values) + 1)
-    y_data = sorted_values * multiplier
 
     # Plot
     fig, ax = plt.subplots(figsize=(16, 12), constrained_layout=True)
@@ -1684,7 +2434,9 @@ def plot_load_duration_curve(
 
     ax.set_title(f"Load Duration Curve ({interval}): {diff_column.replace('Diff', 'Netto')}")
     ax.set_xlabel("Time (1 year)")
-    ax.set_ylabel(axis_label_with_unit(diff_column, "Power"))
+    ax.set_ylabel(axis_label_with_unit(
+        diff_column, "Power", overrides={diff_column: converted_unit},
+    ))
     ax.legend()
     ax.grid(True)
 

@@ -15,7 +15,7 @@ import pytest
 
 import ibis
 
-from etdmap.mapping_helpers import (
+from etdmap.data_stats import (
     NUMERIC_STATS_SCHEMA,
     compute_numeric_column_stats,
 )
