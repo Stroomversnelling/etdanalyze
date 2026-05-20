@@ -988,7 +988,7 @@ def compute_stats_table_lazy(
     scales cleanly even on heavily-joined ibis tables (climate's
     ``join_index_table -> join_weather_data`` chain).
 
-    See ``etdworkflow/docs/performance/lazy-join-strategies.md`` for
+    See ``etdworkflow/docs/performance/lazy-join-strategies-2026-05-09.md`` for
     the per-col vs batched vs cached comparison on the real climate
     workflow (batched is ~1.86x faster than per-col and matches the
     hoist+pandas approach end-to-end).
@@ -1020,7 +1020,7 @@ def compute_stats_table_lazy(
     # joins and the parquet scan are computed once per call instead of
     # once per variable. On the climate workflow (3 vars per call, index +
     # weather joins) this is ~1.9x faster than the per-variable version.
-    # See etdworkflow/docs/performance/lazy-join-strategies.md.
+    # See etdworkflow/docs/performance/lazy-join-strategies-2026-05-09.md.
     agg_exprs: dict = {}
     for col in available_cols:
         e = tbl[col]

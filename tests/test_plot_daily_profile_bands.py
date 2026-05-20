@@ -49,20 +49,29 @@ def test_rejects_all_na_input():
         plot_daily_profile_bands(df, _TEST_COL)
 
 
-def test_rejects_energy_per_interval_unit():
-    """Strict unit class assertion -- same set as other profile helpers."""
+def test_rejects_cumulatief_meter():
+    """Per ADR-003, a cumulative meter reading (Cumulatief=ja) is not
+    longitudinally renderable -- the gate raises and points the caller
+    at the Diff variant."""
     df = _synthetic_hourly().rename(columns={_TEST_COL: "ElektriciteitNetgebruikHoog"})
-    with pytest.raises(ValueError, match="not in the unit classes"):
+    with pytest.raises(ValueError, match="cumulative meter reading"):
         plot_daily_profile_bands(df, "ElektriciteitNetgebruikHoog")
 
 
-def test_convert_kwarg_yields_power_axis(tmp_path):
-    """The opt-in conversion kwarg works the same as in other profile helpers."""
-    df = _synthetic_hourly().rename(columns={_TEST_COL: "ElektriciteitNetgebruikHoog"})
+def test_accepts_converted_diff_via_overrides(tmp_path):
+    """After convert_interval_diff produces the converted column and
+    overrides, the plot accepts the new column. Caller-side conversion
+    is the contract (the plot itself does no physics) per ADR-003."""
+    from etdanalyze.units import convert_interval_diff
+    df = _synthetic_hourly().rename(columns={_TEST_COL: "ElektriciteitNetgebruikHoogDiff"})
+    df_conv, conv_overrides, name_map = convert_interval_diff(
+        df, "ElektriciteitNetgebruikHoogDiff", interval="60min",
+    )
     out = tmp_path / "dagprofielbands_kw.png"
     plot_daily_profile_bands(
-        df, "ElektriciteitNetgebruikHoog",
-        convert_from_energy_per_interval=pd.Timedelta(hours=1),
+        df_conv,
+        name_map["ElektriciteitNetgebruikHoogDiff"],
+        overrides=conv_overrides,
         save_fig_path=str(out),
     )
     assert out.exists() and out.stat().st_size > 0

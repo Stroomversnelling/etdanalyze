@@ -131,6 +131,13 @@ _RANGE_CLUSTER_MIN_VISIBLE_RATIO = 0.05  # a group's range / cluster y-axis must
                                           # be at least this much; below this
                                           # the group's box is visually cramped
                                           # and belongs in its own cluster
+_RANGE_CLUSTER_MAX_OOM_RATIO = 100.0  # for all-positive clusters, split when
+                                       # cluster_max / cluster_min exceeds this
+                                       # ratio (~ 2 decades). Catches the case
+                                       # where groups have zero internal range
+                                       # but absolute values differ by orders
+                                       # of magnitude, so small ones collapse
+                                       # to invisible pixels near the axis bottom.
 
 
 def detect_value_range_clusters(
@@ -182,10 +189,29 @@ def detect_value_range_clusters(
     sorted_keys = list(maxs.sort_values().index)
     ranges = {k: float(maxs[k]) - float(mins[k]) for k in sorted_keys}
 
-    def _any_cramped(member_keys, span: float) -> bool:
+    def _any_cramped(member_keys, span: float,
+                     cluster_min: float, cluster_max: float) -> bool:
+        # Order-of-magnitude criterion: when all values in the cluster are
+        # strictly positive and span more than _RANGE_CLUSTER_MAX_OOM_RATIO,
+        # small groups collapse to invisible pixels near the axis bottom on
+        # a linear chart. This triggers a split even when member groups have
+        # zero internal range (point markers) -- the values must remain
+        # visually distinguishable across the cluster's y-axis.
+        # Skip when the cluster crosses or touches zero / negative (e.g.
+        # temperatures in degC): ratio is undefined / meaningless, and the
+        # absolute span is what governs readability there.
+        if cluster_min > 0 and cluster_max / cluster_min > _RANGE_CLUSTER_MAX_OOM_RATIO:
+            return True
         if span <= 0:
             return False  # all members are at the same point; nothing cramped
         for k in member_keys:
+            # Zero-range groups are point markers (a single horizontal line
+            # mark on the boxplot, not a stretched box). They remain visible
+            # at any cluster span, so they cannot be "cramped" in the
+            # box-flattening sense. Splits between point-marker groups are
+            # driven by the OOM criterion above.
+            if ranges[k] == 0:
+                continue
             if ranges[k] / span < _RANGE_CLUSTER_MIN_VISIBLE_RATIO:
                 return True
         return False
@@ -205,7 +231,7 @@ def detect_value_range_clusters(
         new_min = min(cur_min, kmin)
         new_max = max(cur_max, kmax)
         new_span = new_max - new_min
-        if _any_cramped(current + [key], new_span):
+        if _any_cramped(current + [key], new_span, new_min, new_max):
             clusters.append(set(current))
             current = [key]
             cur_min = kmin
@@ -288,13 +314,14 @@ def plot_var_vs_temp(
 
     df = df.sort_values('ReadingDate')
 
-    # Layer 3 strict-unit assertion on both axes.
-    from etdanalyze.units import assert_unit_in_classes
-    var_unit = resolve_unit(var, overrides=overrides)
-    assert_unit_in_classes(
-        var_unit, var,
-        accepted_classes={"power", "temperature", "flow_rate", "state",
-                          "ratio", "volume_per_interval"},
+    # Layer 3 (ADR-003): the left y is any instantaneous variable
+    # (metadata-driven Momentaan check); the right y is temperature
+    # specifically (physics-constrained -- keep the unit-class check).
+    from etdanalyze.units import (
+        assert_renderable_on_timeline, assert_unit_in_classes,
+    )
+    assert_renderable_on_timeline(
+        var, overrides=overrides,
         plot_type="plot_var_vs_temp", axis="left y",
     )
     temp_unit_resolved = resolve_unit(temp_col, overrides=overrides)
@@ -331,26 +358,17 @@ def plot_var_vs_temp(
     plt.show()
 
 
-def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=None, overrides=None, save_fig_path=None, convert_from_energy_per_interval=None):
+def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=None, overrides=None, save_fig_path=None):
     """
     Plot seasonal data for a specific project, showing statistical ranges and mean values.
 
-    Unit handling is strict (Layer 3): the helper resolves ``plot_var``'s
-    declared unit via the data model (or ``overrides``) and asserts it
-    belongs to an instantaneous unit class (power / temperature /
-    flow_rate / state / ratio / volume_per_interval). Energy-per-interval
-    (kWh / Wh / GJ) is **not** accepted as a plot input -- a daily
-    profile reads as power, not as "kWh per row".
-
-    To plot an energy-per-interval column as a power profile, pass
-    ``convert_from_energy_per_interval=<pd.Timedelta>``. The helper then
-    L3-asserts the column is in the ``energy_per_interval`` class,
-    delegates to ``etdanalyze.units.convert_energy_per_interval_to_power``
-    (single source of truth for the conversion math), attaches the
-    converted Series as a new derived column on a shallow copy of ``df``
-    via ``df.assign`` (the input DataFrame is not mutated), and proceeds
-    with the converted column. Memory cost: one new Series the length
-    of the post-filter DataFrame.
+    Layer-3 gate (ADR-003): ``plot_var`` must be longitudinally
+    renderable -- either ``Momentaan="ja"`` in the data model, or
+    declared so via ``overrides={col: {"momentaan": True}}``. For
+    Diff variables (``Diff="ja"``), call
+    ``etdanalyze.units.convert_interval_diff(df, col, interval=...)``
+    upstream of this helper and pass the new column name + returned
+    overrides; this helper does no conversion itself.
 
     Parameters
     ----------
@@ -367,20 +385,13 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
     project_id: int|str:
         Optional: when provided the df is filtered to only contain data of that project.
     overrides : dict, optional
-        ``{col: unit}`` map forwarded to ``resolve_unit`` /
-        ``axis_label_with_unit``. Required when ``plot_var`` is a
-        derived variant not in the etdmap data model (use ``""`` for
-        unitless).
+        ``{col: unit}`` or nested
+        ``{col: {"unit": ..., "momentaan": True}}`` map forwarded to
+        ``resolve_unit`` / ``axis_label_with_unit`` and to the timeline
+        gate. Required when ``plot_var`` is a derived variant not in
+        the etdmap data model.
     save_fig_path : str, optional
         File path to save the plot. If None, the figure is returned.
-    convert_from_energy_per_interval : pd.Timedelta or str, optional
-        Caller-declared row spacing of ``plot_var`` (e.g.
-        ``pd.Timedelta(hours=1)`` for a frame loaded from
-        ``household_60min.parquet``). When set, ``plot_var`` is
-        converted from energy-per-interval to mean power before
-        plotting. The caller passes the interval explicitly because
-        they know it from the data's provenance; helpers do not
-        infer.
 
     Returns
     -------
@@ -391,29 +402,13 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
     # add time_of_day column that sets the times correctly.
     df_normalized_dt = etdtransform.calculated_columns.add_normalized_datetime(df).copy()
 
-    # Optional caller-declared conversion: energy-per-interval -> power.
-    # Conversion math lives in etdanalyze.units; this helper just opts
-    # the column in. Returns df unchanged when the kwarg is None.
-    from etdanalyze.units import (
-        assert_unit_in_classes,
-        apply_optional_energy_conversion,
-    )
-    df_normalized_dt, plot_var, overrides = apply_optional_energy_conversion(
-        df_normalized_dt, plot_var, convert_from_energy_per_interval,
-        overrides, plot_type="plot_daily_profile",
-    )
-
-    # Layer 3 strict-unit assertion: a daily profile reads an
-    # instantaneous-style value at each minute-of-day, so the y-axis
-    # values must belong to an instantaneous unit class. The
-    # conversion above, if any, has already replaced the working
-    # column with a power Series so the assertion passes naturally.
-    unit = resolve_unit(plot_var, overrides=overrides)
-    assert_unit_in_classes(
-        unit, plot_var,
-        accepted_classes={"power", "power_per_area", "temperature",
-                          "flow_rate", "state", "ratio",
-                          "volume_per_interval"},
+    # Layer 3 timeline gate (ADR-003): the variable must be declared
+    # instantaneous. Diff variables are rejected with a hint to call
+    # convert_interval_diff upstream; cumulative meter readings with a
+    # hint to plot the corresponding Diff variant.
+    from etdanalyze.units import assert_renderable_on_timeline
+    assert_renderable_on_timeline(
+        plot_var, overrides=overrides,
         plot_type="plot_daily_profile", axis="y",
     )
 
@@ -457,27 +452,41 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
 
     fig, ax = plt.subplots(figsize=(12, 8))
 
+    # Each project's per-hour stat values must be drawn as its own line.
+    # If we hand matplotlib the full pooled summary_df (P rows x 24 hours,
+    # ordered by project then hour) in a single ax.plot() call, it draws
+    # connectors from each project's 23:00 point back to the next
+    # project's 00:00 point -- those connectors appear as straight
+    # near-horizontal lines that wrap across the chart and look like
+    # "flat lines with no midday bump". Loop per project so each arc is
+    # its own line trace; legend label is set once per stat.
+    projects_present = sorted(summary_df["ProjectIdBSV"].dropna().unique())
+
     # Plot statistical ranges (min, p25, median, p75, max)
     for i, stat in enumerate(stats_to_plot):
-        ax.plot(
-            pd.to_datetime(summary_df["time_of_day"], format="%H:%M:%S"),
-            summary_df[stat],
-            linestyle="-",
-            linewidth=0.8,
-            color=stat_colors[i],
-            alpha=0.5,
-            label=stat,
-        )
+        for j, pid in enumerate(projects_present):
+            proj_df = summary_df[summary_df["ProjectIdBSV"] == pid]
+            ax.plot(
+                pd.to_datetime(proj_df["time_of_day"], format="%H:%M:%S"),
+                proj_df[stat],
+                linestyle="-",
+                linewidth=0.8,
+                color=stat_colors[i],
+                alpha=0.5,
+                label=stat if j == 0 else None,
+            )
 
     # Highlight the mean value
-    ax.plot(
-        pd.to_datetime(summary_df["time_of_day"], format="%H:%M:%S"),
-        summary_df["mean"],
-        linestyle="-",
-        linewidth=2,
-        color="purple",
-        label="mean",
-    )
+    for j, pid in enumerate(projects_present):
+        proj_df = summary_df[summary_df["ProjectIdBSV"] == pid]
+        ax.plot(
+            pd.to_datetime(proj_df["time_of_day"], format="%H:%M:%S"),
+            proj_df["mean"],
+            linestyle="-",
+            linewidth=2,
+            color="purple",
+            label="mean" if j == 0 else None,
+        )
 
     # Strict label resolution: data-model unit or caller's overrides.
     # The Layer-3 assertion above has already verified the unit is in
@@ -522,25 +531,17 @@ def plot_daily_profile_bands(
         project_id: Optional[int | str] = None,
         overrides: Optional[dict] = None,
         save_fig_path: Optional[str] = None,
-        convert_from_energy_per_interval: "pd.Timedelta | str | None" = None,
 ):
     """
     Band-style daily profile (companion to ``plot_daily_profile``).
 
     Shows the same 24-hour-of-day shape, but with the canonical 4-layer
     band stack used by ``plot_weekly_profile`` / ``plot_annual_profile``
-    -- min-max, p01-p99, p25-p75, median line, mean line. No per-stat
-    line breakdown (use ``plot_daily_profile`` for that, kept side by
-    side for callers that want the per-project stat lines).
+    -- min-max, p01-p99, p25-p75, median line, mean line.
 
-    Both helpers share the same input contract, unit conventions, and
-    strict empty-data guard. Use ``plot_daily_profile`` when you want
-    to see each statistic as its own line; use this when you want the
-    weekly / annual layout for visual consistency.
-
-    Strict-unit handling: ``plot_var`` must resolve to an instantaneous
-    unit class. Pass ``convert_from_energy_per_interval=<pd.Timedelta>``
-    for the kWh -> kW opt-in. Same shape as the other profile helpers.
+    Layer-3 gate (ADR-003): see ``plot_daily_profile``. For Diff
+    variables, call ``etdanalyze.units.convert_interval_diff`` upstream
+    and pass the new column + returned overrides.
 
     Parameters
     ----------
@@ -558,13 +559,11 @@ def plot_daily_profile_bands(
         When provided, filters df to that project before grouping by
         hour-of-day.
     overrides : dict, optional
-        Per-call ``{col: unit}`` -- forwarded to ``resolve_unit`` /
-        ``axis_label_with_unit``.
+        Per-call ``{col: unit}`` or nested
+        ``{col: {"unit": ..., "momentaan": True}}`` -- forwarded to
+        ``resolve_unit`` / ``axis_label_with_unit`` and the timeline gate.
     save_fig_path : str, optional
         File path. If None, returns the figure.
-    convert_from_energy_per_interval : pd.Timedelta or str, optional
-        Opt-in energy-per-interval -> power conversion. See
-        ``plot_daily_profile`` for the full contract.
 
     Returns
     -------
@@ -584,14 +583,11 @@ def plot_daily_profile_bands(
             f"Check coverage upstream and skip the call."
         )
 
-    # Optional caller-declared energy-per-interval -> power conversion.
-    from etdanalyze.units import (
-        assert_unit_in_classes,
-        apply_optional_energy_conversion,
-    )
-    df, plot_var, overrides = apply_optional_energy_conversion(
-        df, plot_var, convert_from_energy_per_interval,
-        overrides, plot_type="plot_daily_profile_bands",
+    # Layer 3 timeline gate (ADR-003): metadata-driven Momentaan check.
+    from etdanalyze.units import assert_renderable_on_timeline
+    assert_renderable_on_timeline(
+        plot_var, overrides=overrides,
+        plot_type="plot_daily_profile_bands", axis="y",
     )
 
     df["hour_of_day"] = df["ReadingDate"].dt.hour
@@ -615,17 +611,6 @@ def plot_daily_profile_bands(
             linewidth=0.9, color="steelblue", alpha=0.7, label="median")
     ax.plot(summary["hour_of_day"], summary["mean"],
             linewidth=2, color="purple", label="mean")
-
-    # Layer 3 strict-unit assertion -- same accepted classes as the
-    # other profile helpers.
-    _unit = resolve_unit(plot_var, overrides=overrides)
-    assert_unit_in_classes(
-        _unit, plot_var,
-        accepted_classes={"power", "power_per_area", "temperature",
-                          "flow_rate", "state", "ratio",
-                          "volume_per_interval"},
-        plot_type="plot_daily_profile_bands", axis="y",
-    )
 
     ax.set_xlabel("Hour of day")
     ax.set_ylabel(axis_label_with_unit(plot_var, plot_var_name, overrides=overrides))
@@ -712,20 +697,18 @@ def plot_daily_profile_mean_combined(
             f"Check coverage upstream and skip the call."
         )
 
-    # Layer 3 strict-unit assertion (per variable). A combined daily
-    # profile reads as a stacked instantaneous view; energy-per-
-    # interval is rejected here for the same reason as in
-    # plot_daily_profile -- callers convert upstream and declare the
-    # resulting power unit via ``overrides``.
-    from etdanalyze.units import assert_unit_in_classes
+    # Layer 3 timeline gate (ADR-003) per variable: each var on the
+    # stacked y-axis must be instantaneous per the data model. The
+    # caller's ``overrides`` apply per-variable; conversion opt-in is
+    # done upstream by the caller (this helper does not accept a
+    # convert_from_energy_per_interval kwarg -- callers convert before
+    # passing).
+    from etdanalyze.units import assert_renderable_on_timeline
     for var in plot_vars:
         if var not in df.columns:
             continue
-        unit = resolve_unit(var, overrides=overrides)
-        assert_unit_in_classes(
-            unit, var,
-            accepted_classes={"power", "temperature", "flow_rate", "state",
-                              "ratio", "volume_per_interval"},
+        assert_renderable_on_timeline(
+            var, overrides=overrides,
             plot_type="plot_daily_profile_mean_combined", axis="y",
         )
     converted_units: dict = {}
@@ -799,7 +782,6 @@ def plot_weekly_profile(
         project_id: Optional[int | str] = None,
         overrides: Optional[dict] = None,
         save_fig_path: Optional[str] = None,
-        convert_from_energy_per_interval: "pd.Timedelta | str | None" = None,
 ):
     """
     Plot the weekly profile (weekprofiel) for a variable.
@@ -808,12 +790,9 @@ def plot_weekly_profile(
     producing 168 data points across 7 day panels on a single x-axis.
     Min/p25/median/p75/max bands are shown as shading and thin lines.
 
-    Strict-unit handling: ``plot_var`` must resolve to an instantaneous
-    unit class (power / temperature / flow_rate / state / ratio /
-    volume_per_interval). Pass ``convert_from_energy_per_interval=
-    <pd.Timedelta>`` to opt-in to energy-per-interval -> power
-    conversion via the shared helper -- see ``plot_daily_profile`` for
-    the full contract.
+    Layer-3 gate (ADR-003): see ``plot_daily_profile``. For Diff
+    variables, call ``etdanalyze.units.convert_interval_diff`` upstream
+    and pass the new column + returned overrides.
 
     Parameters
     ----------
@@ -827,11 +806,11 @@ def plot_weekly_profile(
         Y-axis label. Defaults to plot_var.
     project_id : int or str, optional
         When provided, filters df to that project.
+    overrides : dict, optional
+        Per-call ``{col: unit}`` or nested
+        ``{col: {"unit": ..., "momentaan": True}}``.
     save_fig_path : str, optional
         File path to save the figure. If None, the figure is returned.
-    convert_from_energy_per_interval : pd.Timedelta or str, optional
-        Opt-in energy-per-interval -> mean-power conversion. See
-        ``plot_daily_profile`` for the full contract.
 
     Returns
     -------
@@ -853,14 +832,11 @@ def plot_weekly_profile(
             f"Check coverage upstream and skip the call."
         )
 
-    # Optional caller-declared energy-per-interval -> power conversion.
-    from etdanalyze.units import (
-        assert_unit_in_classes,
-        apply_optional_energy_conversion,
-    )
-    df, plot_var, overrides = apply_optional_energy_conversion(
-        df, plot_var, convert_from_energy_per_interval,
-        overrides, plot_type="plot_weekly_profile",
+    # Layer 3 timeline gate (ADR-003): metadata-driven Momentaan check.
+    from etdanalyze.units import assert_renderable_on_timeline
+    assert_renderable_on_timeline(
+        plot_var, overrides=overrides,
+        plot_type="plot_weekly_profile", axis="y",
     )
 
     df["day_of_week"] = df["ReadingDate"].dt.dayofweek   # 0=Mon, 6=Sun
@@ -896,17 +872,6 @@ def plot_weekly_profile(
     for day in range(7):
         ax.axvline(day * 24, color="gray", linewidth=0.5, linestyle="--")
 
-    # Layer 3 strict-unit assertion -- same expectations as
-    # plot_daily_profile: a weekly profile's y-axis reads as an
-    # instantaneous value at each (day, hour) cell.
-    _unit = resolve_unit(plot_var, overrides=overrides)
-    assert_unit_in_classes(
-        _unit, plot_var,
-        accepted_classes={"power", "power_per_area", "temperature",
-                          "flow_rate", "state", "ratio",
-                          "volume_per_interval"},
-        plot_type="plot_weekly_profile", axis="y",
-    )
     ax.set_xlabel("Day of week / hour")
     ax.set_ylabel(axis_label_with_unit(plot_var, plot_var_name, overrides=overrides))
     ax.xaxis.set_major_locator(mticker.MultipleLocator(24))
@@ -934,7 +899,6 @@ def plot_annual_profile(
         project_id: Optional[int | str] = None,
         overrides: Optional[dict] = None,
         save_fig_path: Optional[str] = None,
-        convert_from_energy_per_interval: "pd.Timedelta | str | None" = None,
 ):
     """
     Plot the annual profile (jaarprofiel) for a variable.
@@ -942,10 +906,9 @@ def plot_annual_profile(
     Shows mean and p25-p75 band for each day-of-year (1-366),
     revealing seasonal patterns across the year.
 
-    Strict-unit handling: ``plot_var`` must resolve to an instantaneous
-    unit class. Pass ``convert_from_energy_per_interval=<pd.Timedelta>``
-    to opt-in to energy-per-interval -> power conversion via the
-    shared helper -- see ``plot_daily_profile`` for the full contract.
+    Layer-3 gate (ADR-003): see ``plot_daily_profile``. For Diff
+    variables, call ``etdanalyze.units.convert_interval_diff`` upstream
+    and pass the new column + returned overrides.
 
     Parameters
     ----------
@@ -959,11 +922,11 @@ def plot_annual_profile(
         Y-axis label. Defaults to plot_var.
     project_id : int or str, optional
         When provided, filters df to that project.
+    overrides : dict, optional
+        Per-call ``{col: unit}`` or nested
+        ``{col: {"unit": ..., "momentaan": True}}``.
     save_fig_path : str, optional
         File path to save the figure. If None, the figure is returned.
-    convert_from_energy_per_interval : pd.Timedelta or str, optional
-        Opt-in energy-per-interval -> mean-power conversion. See
-        ``plot_daily_profile`` for the full contract.
 
     Returns
     -------
@@ -983,14 +946,11 @@ def plot_annual_profile(
             f"Check coverage upstream and skip the call."
         )
 
-    # Optional caller-declared energy-per-interval -> power conversion.
-    from etdanalyze.units import (
-        assert_unit_in_classes,
-        apply_optional_energy_conversion,
-    )
-    df, plot_var, overrides = apply_optional_energy_conversion(
-        df, plot_var, convert_from_energy_per_interval,
-        overrides, plot_type="plot_annual_profile",
+    # Layer 3 timeline gate (ADR-003): metadata-driven Momentaan check.
+    from etdanalyze.units import assert_renderable_on_timeline
+    assert_renderable_on_timeline(
+        plot_var, overrides=overrides,
+        plot_type="plot_annual_profile", axis="y",
     )
     df["day_of_year"] = df["ReadingDate"].dt.dayofyear
 
@@ -1022,16 +982,6 @@ def plot_annual_profile(
         ax.axvline(start, color="gray", linewidth=0.4, linestyle="--")
         ax.text(start + 0.5, ax.get_ylim()[1], name, fontsize=7, color="gray", va="top")
 
-    # Layer 3 strict-unit assertion -- annual profile reads as an
-    # instantaneous value at each day-of-year position.
-    _unit = resolve_unit(plot_var, overrides=overrides)
-    assert_unit_in_classes(
-        _unit, plot_var,
-        accepted_classes={"power", "power_per_area", "temperature",
-                          "flow_rate", "state", "ratio",
-                          "volume_per_interval"},
-        plot_type="plot_annual_profile", axis="y",
-    )
     ax.set_xlabel("Day of year")
     ax.set_ylabel(axis_label_with_unit(plot_var, plot_var_name, overrides=overrides))
     ax.legend()
@@ -1513,7 +1463,6 @@ def plot_monthly_profile(
         plot_var_name: Optional[str] = None,
         overrides: Optional[dict] = None,
         save_fig_path: Optional[str] = None,
-        convert_from_energy_per_interval: "pd.Timedelta | str | None" = None,
 ):
     """
     Plot the monthly profile (maandprofiel) as a heatmap: 12 months x 24 hours = 288 slots.
@@ -1522,10 +1471,9 @@ def plot_monthly_profile(
     aggregated over all rows in df. The heatmap is compact and directly comparable across
     variables and domains.
 
-    Strict-unit handling: ``plot_var`` must resolve to an instantaneous
-    unit class. Pass ``convert_from_energy_per_interval=<pd.Timedelta>``
-    to opt-in to energy-per-interval -> power conversion via the
-    shared helper -- see ``plot_daily_profile`` for the full contract.
+    Layer-3 gate (ADR-003): see ``plot_daily_profile``. For Diff
+    variables, call ``etdanalyze.units.convert_interval_diff`` upstream
+    and pass the new column + returned overrides.
 
     Parameters
     ----------
@@ -1537,11 +1485,11 @@ def plot_monthly_profile(
         Plot title. Defaults to "Monthly profile: {plot_var_name}".
     plot_var_name : str, optional
         Colorbar label and title suffix. Defaults to plot_var.
+    overrides : dict, optional
+        Per-call ``{col: unit}`` or nested
+        ``{col: {"unit": ..., "momentaan": True}}``.
     save_fig_path : str, optional
         File path to save the figure. If None, the figure is returned.
-    convert_from_energy_per_interval : pd.Timedelta or str, optional
-        Opt-in energy-per-interval -> mean-power conversion. See
-        ``plot_daily_profile`` for the full contract.
 
     Returns
     -------
@@ -1559,14 +1507,13 @@ def plot_monthly_profile(
             f"Check coverage upstream and skip the call."
         )
 
-    # Optional caller-declared energy-per-interval -> power conversion.
-    from etdanalyze.units import (
-        assert_unit_in_classes,
-        apply_optional_energy_conversion,
-    )
-    df, plot_var, overrides = apply_optional_energy_conversion(
-        df, plot_var, convert_from_energy_per_interval,
-        overrides, plot_type="plot_monthly_profile",
+    # Layer 3 timeline gate (ADR-003): the colorbar encodes the
+    # variable value, so the same Momentaan check applies as for the
+    # other profile helpers' y-axis.
+    from etdanalyze.units import assert_renderable_on_timeline
+    assert_renderable_on_timeline(
+        plot_var, overrides=overrides,
+        plot_type="plot_monthly_profile", axis="colorbar",
     )
 
     df["month"] = df["ReadingDate"].dt.month
@@ -1585,17 +1532,6 @@ def plot_monthly_profile(
         origin="upper",
         cmap="RdYlBu_r",
         interpolation="nearest",
-    )
-    # Layer 3 strict-unit assertion -- monthly heatmap encodes
-    # variable value via colour. Accepts the same instantaneous
-    # classes as the other profile plots.
-    _unit = resolve_unit(plot_var, overrides=overrides)
-    assert_unit_in_classes(
-        _unit, plot_var,
-        accepted_classes={"power", "power_per_area", "temperature",
-                          "flow_rate", "state", "ratio",
-                          "volume_per_interval"},
-        plot_type="plot_monthly_profile", axis="colorbar",
     )
     plt.colorbar(im, ax=ax,
                  label=axis_label_with_unit(plot_var, plot_var_name, overrides=overrides))

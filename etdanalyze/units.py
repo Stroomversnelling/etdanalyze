@@ -27,7 +27,12 @@ from typing import Optional
 
 import pandas as pd
 
-from etdmap.data_model import load_unit_map
+from etdmap.data_model import (
+    cumulative_columns,
+    diff_columns,
+    load_unit_map,
+    momentaan_columns,
+)
 from etdtransform.calculated_columns import switch_multiplier
 
 
@@ -49,6 +54,32 @@ _DAYS_PER_YEAR = 365
 _UNIT_MAP = load_unit_map()
 
 
+# ---------------------------------------------------------------------------
+# Metadata (Layer 3): per-variable classification.
+#
+# Profile plots gate on Momentaan / Diff / Cumulatief (see ADR-003).
+# The classification is exposed by etdmap as module-level list
+# constants (cumulative_columns, momentaan_columns, diff_columns) --
+# the predicates below are thin membership checks over those lists,
+# with per-call override support for synthetic columns.
+# ---------------------------------------------------------------------------
+
+
+def _override_field(overrides: "Optional[dict]", col_name: str, field: str):
+    """Return overrides[col_name][field] when overrides uses the nested
+    shape ``{col: {"unit"|"momentaan"|"cumulatief"|"aggregatie_methode": ...}}``.
+
+    Returns ``None`` when the override is absent or uses the plain
+    ``{col: unit_str}`` shape (which only carries the unit, no metadata).
+    """
+    if overrides is None or col_name not in overrides:
+        return None
+    val = overrides[col_name]
+    if isinstance(val, dict):
+        return val.get(field)
+    return None
+
+
 def _resolve_input_unit(col_name: str, overrides: Optional[dict]) -> str:
     """
     Look up the unit for ``col_name``, allowing per-call overrides.
@@ -57,9 +88,20 @@ def _resolve_input_unit(col_name: str, overrides: Optional[dict]) -> str:
     fallback; a column with no known unit is a bug the caller must fix
     by either passing an override or registering the column in the data
     model.
+
+    Override shapes both supported:
+    - plain ``{col: "kW"}`` -- unit only.
+    - nested ``{col: {"unit": "kW", "momentaan": True}}`` -- unit plus
+      timeline-renderability metadata (see ADR-003).
     """
     if overrides is not None and col_name in overrides:
-        return overrides[col_name]
+        val = overrides[col_name]
+        if isinstance(val, dict):
+            if "unit" in val:
+                return val["unit"]
+            # Nested dict without a "unit" key falls through to data model.
+        else:
+            return val
     unit = _UNIT_MAP.get(col_name, "")
     if not unit:
         raise KeyError(
@@ -160,6 +202,365 @@ def assert_unit_in_classes(
         f"{plot_type}: {axis} column {col_name!r} has unit {unit!r}, "
         f"which is not in the unit classes this plot accepts. "
         f"Accepted: {accepted_summary}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Metadata predicates and timeline-renderability gate.
+#
+# These are the Layer 3 check for *profile* plots (anything where the
+# x-axis is time-of-day, day-of-week, day-of-year, or a heatmap of those
+# combinations). The check is metadata-driven: it asks the data model
+# whether each variable is an instantaneous reading. The unit class is
+# irrelevant -- a Momentaan=ja variable in any unit is renderable on a
+# timeline, whether it's degrees, ppm, J/cm2, or anything else.
+#
+# Physics-specific plots (plot_energy_signature, plot_cop_vs_temp,
+# plot_cop_vs_delta_t) keep the UNIT_CLASS check because they require a
+# specific physical quantity on each axis, not just instantaneous-ness.
+# ---------------------------------------------------------------------------
+
+
+def _bool_truthy(value) -> bool:
+    """Coerce an override choice value to a Python bool, strictly.
+
+    Accepts exactly:
+    - ``True`` / ``False`` (Python bool)
+    - ``"ja"`` / ``"nee"`` (strict -- matches the Grist choice field
+      values, no lowercasing of arbitrary input).
+
+    Anything else raises ``ValueError``. Override values come from
+    application code, but the choice contract is the same as the data
+    model's (ADR-003): sloppy free-text would defeat the gate.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if value == "ja":
+            return True
+        if value == "nee":
+            return False
+    raise ValueError(
+        f"choice override must be True / False / 'ja' / 'nee', got "
+        f"{type(value).__name__}: {value!r}"
+    )
+
+
+def is_momentaan(col_name: str, overrides: Optional[dict] = None) -> bool:
+    """True when the column is declared instantaneous (``Momentaan='ja'``).
+
+    Lookup order: ``overrides[col]["momentaan"]`` -> membership in
+    ``etdmap.data_model.momentaan_columns`` -> ``False``. An override
+    value can be a Python bool or one of the model's ``"ja"``/``"nee"``
+    strings; anything else raises (see ``_bool_truthy``).
+    """
+    ov = _override_field(overrides, col_name, "momentaan")
+    if ov is not None:
+        return _bool_truthy(ov)
+    return col_name in momentaan_columns
+
+
+def is_cumulatief(col_name: str, overrides: Optional[dict] = None) -> bool:
+    """True when the column is a running-total meter reading (``Cumulatief='ja'``).
+
+    Cumulative readings are never plottable on a profile -- their values
+    monotonically increase regardless of the underlying phenomenon. Plot
+    the corresponding Diff variant instead, which represents per-row
+    delta. Membership-checked against
+    ``etdmap.data_model.cumulative_columns``.
+    """
+    ov = _override_field(overrides, col_name, "cumulatief")
+    if ov is not None:
+        return _bool_truthy(ov)
+    return col_name in cumulative_columns
+
+
+def is_diff_variable(col_name: str, overrides: Optional[dict] = None) -> bool:
+    """True when the column is a dataset-cadence delta (``Diff='ja'``).
+
+    Diff variables are interval deltas of cumulative meter readings --
+    e.g. ``ElektriciteitNetgebruikLaagDiff`` is the per-5-min kWh delta
+    of ``ElektriciteitNetgebruikLaag``. Their raw values depend on row
+    cadence, so they are not directly renderable on time profiles.
+    Conversion to an instantaneous-style sibling (e.g. kWh-per-row ->
+    kW) requires a unit-aware converter -- see
+    ``assert_renderable_on_timeline`` for the available conversion paths
+    and what to do when none exists for a variable's unit.
+
+    The ``Diff`` column in the data model is the authoritative signal --
+    not the variable-name suffix. Membership-checked against
+    ``etdmap.data_model.diff_columns``. Several Diff variables (e.g.
+    ``TerugleveringTotaalNetto``, ``Netuitwisseling``) do not carry the
+    suffix in their name but are still deltas; their explicit
+    ``Diff="ja"`` row puts them in the list.
+
+    Per-call override: ``overrides={col: {"diff": True}}`` for synthetic
+    columns.
+    """
+    ov = _override_field(overrides, col_name, "diff")
+    if ov is not None:
+        return _bool_truthy(ov)
+    return col_name in diff_columns
+
+
+# ---------------------------------------------------------------------------
+# Interval-Diff conversion registry and dispatcher.
+#
+# Diff variables (Diff="ja") hold dataset-cadence deltas of cumulative
+# meter readings -- kWh per 5-min row, m3 per row, etc. Their raw values
+# depend on row cadence; they need converting to an instantaneous sibling
+# before any longitudinal output (profile plot, time-series table) can
+# render them honestly.
+#
+# Each unit gets its own converter function. The dispatcher
+# ``convert_interval_diff`` routes by input unit; it has no physics
+# knowledge of its own. Adding a new convertible unit (m3, liter, J/cm^2)
+# is one function + one registry entry; nothing else moves.
+# ---------------------------------------------------------------------------
+
+
+def _unit_slug(unit: str) -> str:
+    """Compact identifier-safe representation of a unit string.
+
+    Used to build default column names for converted variables, e.g.
+    ``"ZonopwekBrutoDiff__kW"`` or ``"GasgebruikDiff__m3_uur"``. No
+    semantic content -- just a deterministic way to embed the unit in
+    a Python identifier.
+    """
+    return (
+        unit
+        .replace("/", "_")
+        .replace(" ", "")
+        .replace("²", "2")   # superscript 2 (m^2)
+    )
+
+
+def _converter_kwh_per_interval(
+    series: pd.Series,
+    col_name: str,
+    *,
+    interval: str,
+    overrides: Optional[dict] = None,
+    new_name: Optional[str] = None,
+) -> tuple[pd.Series, str, str]:
+    """kWh-per-row Diff -> average kW. Wraps ``convert_diff_to_power``."""
+    converted, display_unit = convert_diff_to_power(
+        series, col_name, interval, overrides=overrides,
+    )
+    name = new_name if new_name is not None else f"{col_name}__{_unit_slug(display_unit)}"
+    return converted, name, display_unit
+
+
+def _converter_volume_per_interval(
+    series: pd.Series,
+    col_name: str,
+    *,
+    interval: str,
+    overrides: Optional[dict] = None,
+    new_name: Optional[str] = None,
+) -> tuple[pd.Series, str, str]:
+    """volume-per-row Diff -> average volumetric flow rate.
+
+    Same time-multiplier math as kWh-per-row -> kW (kWh per row * rows
+    per hour = kWh per hour = kW). Here: liter per row * rows per hour =
+    liter per hour ("liter / uur"); analogous for m3 -> "m3 / uur".
+    Display unit preserves the input volume unit with " / uur" appended,
+    landing the result in the ``flow_rate`` UNIT_CLASS so the plot
+    helpers' Layer-3 assertions accept it without further coercion.
+    """
+    input_unit = _resolve_input_unit(col_name, overrides)
+    if input_unit not in {"liter", "m3"}:
+        raise ValueError(
+            f"_converter_volume_per_interval expects input unit "
+            f"'liter' or 'm3' for {col_name!r}; got {input_unit!r}."
+        )
+    converted = series * switch_multiplier(interval)
+    display_unit = f"{input_unit} / uur"
+    name = new_name if new_name is not None else f"{col_name}__{_unit_slug(display_unit)}"
+    return converted, name, display_unit
+
+
+_INTERVAL_DIFF_CONVERTERS: "dict[str, callable]" = {
+    "kWh":   _converter_kwh_per_interval,
+    "liter": _converter_volume_per_interval,
+    "m3":    _converter_volume_per_interval,
+    # Future entries land here alongside their converter implementation.
+    # Each entry: input_unit -> callable with the same signature shape:
+    #     (series, col_name, *, interval, overrides, new_name)
+    #     -> (converted_series, new_name, display_unit)
+}
+
+
+def convert_interval_diff(
+    df: pd.DataFrame,
+    *col_names: str,
+    interval: str,
+    overrides: Optional[dict] = None,
+    new_names: "Optional[dict[str, str]]" = None,
+) -> "tuple[pd.DataFrame, dict[str, dict[str, object]], dict[str, str]]":
+    """Convert one or more interval-Diff columns to their longitudinal sibling.
+
+    Looks up each column's unit (overrides -> data model), dispatches to
+    the converter registered for that unit in
+    ``_INTERVAL_DIFF_CONVERTERS``, attaches the result to the returned
+    DataFrame, and builds an ``overrides`` dict ready to pass to any
+    plot helper.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Source frame containing each ``col_name``.
+    *col_names : str
+        One or more column names to convert. Mixed units in one call
+        are fine: each column dispatches independently.
+    interval : str
+        Row cadence label (``"5min"``, ``"15min"``, ``"60min"``, ...).
+        Passed through to each converter; converters may use it or
+        ignore it depending on their physics.
+    overrides : dict, optional
+        Per-call unit / classification overrides used by the unit
+        resolver. Same shape as elsewhere in this module.
+    new_names : dict[str, str], optional
+        Per-column override for the new column name. Default name is
+        ``f"{col}__{unit_slug}"``.
+
+    Returns
+    -------
+    (df_with_new_cols, overrides, name_map)
+        - ``df_with_new_cols``: shallow copy of ``df`` with one new
+          column per requested conversion attached.
+        - ``overrides``: keyed by NEW column name, ready to pass to any
+          plot helper:
+          ``{"ZonopwekBrutoDiff__kW": {"unit": "kW", "momentaan": True}, ...}``.
+        - ``name_map``: ``{original_col: new_col_name}`` -- useful for
+          callers that loop over original names (e.g. composing plot
+          titles with the original variable name).
+
+    Raises
+    ------
+    ValueError
+        No converter is registered for one of the requested columns'
+        units. Error names the registered units.
+    """
+    if not col_names:
+        raise ValueError(
+            "convert_interval_diff: pass one or more column names."
+        )
+    new_names = dict(new_names) if new_names else {}
+    # Build the attachments dict, then do ONE df.assign(**attachments)
+    # at the end. df.assign returns a new df with the new columns
+    # attached but SHARES the original column arrays (no deep copy),
+    # so memory + CPU cost is just the new converted Series themselves.
+    attachments: dict = {}
+    out_overrides: dict = {}
+    name_map: "dict[str, str]" = {}
+    for col in col_names:
+        unit = _resolve_input_unit(col, overrides)
+        converter = _INTERVAL_DIFF_CONVERTERS.get(unit)
+        if converter is None:
+            registered = ", ".join(sorted(_INTERVAL_DIFF_CONVERTERS)) or "(none)"
+            raise ValueError(
+                f"convert_interval_diff: no converter registered for unit "
+                f"{unit!r} (column {col!r}). Registered units: {registered}. "
+                f"Add a converter function and register it in "
+                f"_INTERVAL_DIFF_CONVERTERS in etdanalyze.units before "
+                f"calling this for {unit!r}-Diff variables."
+            )
+        converted, new_name, display_unit = converter(
+            df[col], col,
+            interval=interval,
+            overrides=overrides,
+            new_name=new_names.get(col),
+        )
+        attachments[new_name] = converted
+        out_overrides[new_name] = {"unit": display_unit, "momentaan": True}
+        name_map[col] = new_name
+    out_df = df.assign(**attachments)
+    return out_df, out_overrides, name_map
+
+
+def assert_renderable_on_timeline(
+    col_name: str,
+    *,
+    overrides: Optional[dict] = None,
+    plot_type: str = "<plot>",
+    axis: str = "y",
+) -> None:
+    """Raise ``ValueError`` if ``col_name`` cannot be plotted on a time profile.
+
+    A column is renderable on a timeline when its data-model metadata
+    declares it instantaneous (``Momentaan='ja'``), or a per-call
+    override declares it so.
+
+    Two specific failure modes surface with tailored hints:
+
+    - ``Cumulatief='ja'``: cumulative meter reading. Plot the
+      corresponding Diff variant.
+    - ``Diff='ja'``: dataset-cadence delta. Call
+      :func:`convert_interval_diff` upstream of the plot to convert it
+      to an instantaneous sibling, then pass the new column name plus
+      the returned overrides to the plot helper.
+
+    Parameters
+    ----------
+    col_name : str
+        Column name being plotted; looked up in the data model first.
+    overrides : dict, optional
+        Per-call overrides. Plain ``{col: "kW"}`` covers unit only;
+        nested ``{col: {"unit": "kW", "momentaan": True}}`` adds the
+        timeline-renderability flag for synthetic columns.
+    plot_type : str
+        Name of the calling plot helper. Used in error messages.
+    axis : str
+        Which axis the column drives ("y" / "colorbar" / etc.).
+
+    Raises
+    ------
+    ValueError
+        The column is not renderable: it is cumulative, an unconverted
+        Diff, or has no Momentaan flag in the data model and no
+        override declaring it instantaneous.
+    """
+    if is_momentaan(col_name, overrides):
+        return
+    if is_cumulatief(col_name, overrides):
+        raise ValueError(
+            f"{plot_type}: {axis} column {col_name!r} is a cumulative meter "
+            f"reading (Cumulatief=ja). Cumulative readings are not "
+            f"plottable on a time profile -- their values monotonically "
+            f"increase regardless of the underlying phenomenon. Plot the "
+            f"corresponding Diff variant instead."
+        )
+    if is_diff_variable(col_name, overrides):
+        unit = ""
+        try:
+            unit = _resolve_input_unit(col_name, overrides)
+        except KeyError:
+            pass
+        registered = sorted(_INTERVAL_DIFF_CONVERTERS)
+        if unit in _INTERVAL_DIFF_CONVERTERS:
+            raise ValueError(
+                f"{plot_type}: {axis} column {col_name!r} is a "
+                f"dataset-cadence delta (Diff=ja) in {unit!r}. Call "
+                f"etdanalyze.units.convert_interval_diff(df, {col_name!r}, "
+                f"interval=<row cadence>) before plotting, then pass the "
+                f"returned new-column name and overrides to the plot helper."
+            )
+        registered_str = ", ".join(registered) or "(none)"
+        raise ValueError(
+            f"{plot_type}: {axis} column {col_name!r} is a dataset-cadence "
+            f"delta (Diff=ja) in {unit!r}. No converter is currently "
+            f"registered for {unit!r}-Diff. Registered units: {registered_str}. "
+            f"Add a converter in etdanalyze.units (register in "
+            f"_INTERVAL_DIFF_CONVERTERS) before plotting."
+        )
+    raise ValueError(
+        f"{plot_type}: {axis} column {col_name!r} has no Momentaan flag in "
+        f"the data model and no per-call override declares it instantaneous. "
+        f"Set Momentaan=ja in etdmodel.csv (Grist source of truth) if the "
+        f"column belongs in the data model, or pass "
+        f"overrides={{{col_name!r}: {{'momentaan': True}}}} for a synthetic "
+        f"column."
     )
 
 
@@ -370,95 +771,6 @@ def convert_energy_per_interval_to_power(
         # GJ -> kWh (* 1000 / 3.6) -> kW (/ hours)
         return series * (1000.0 / 3.6) / hours, "kW"
     raise AssertionError("unreachable")  # pragma: no cover
-
-
-def apply_optional_energy_conversion(
-    df: pd.DataFrame,
-    plot_var: str,
-    convert_from_energy_per_interval: "pd.Timedelta | str | None",
-    overrides: Optional[dict],
-    *,
-    plot_type: str,
-) -> tuple[pd.DataFrame, str, Optional[dict]]:
-    """Shared "opt-in convert" hook for plot helpers.
-
-    When ``convert_from_energy_per_interval`` is ``None``, returns the
-    inputs unchanged so the calling plot helper proceeds with the
-    declared column.
-
-    When it is a ``pd.Timedelta`` (or Timedelta-parseable string), this
-    helper:
-
-    1. L3-asserts the *source* column resolves to a unit in the
-       ``energy_per_interval`` class. The caller's act of passing this
-       kwarg is a declaration that the column is energy-per-interval;
-       we verify that matches the declared unit (data model or
-       ``overrides``) and raise ``ValueError`` if not.
-    2. Calls ``convert_energy_per_interval_to_power`` once, on the
-       column as-is in ``df``. The conversion math lives in that
-       helper alone -- this function never re-implements it.
-    3. Returns ``(df.assign(<new_col>=converted), new_col, overrides2)``
-       where ``new_col = power_display_name(plot_var)`` and
-       ``overrides2`` is a shallow copy of ``overrides`` extended with
-       ``{new_col: display_unit}`` so the plot helper's existing
-       label / L3 path sees the converted unit.
-
-    The plot helper then proceeds with ``working_col`` instead of
-    ``plot_var`` and asserts the standard accepted classes for its
-    plot type; the converted unit ("kW" / "W") will satisfy the
-    ``power`` class. The input DataFrame is not mutated -- the new
-    column is attached via ``df.assign``, which returns a shallow
-    copy that shares backing arrays for unchanged columns. Memory
-    cost: one new Series the length of the post-filter ``df``.
-
-    Memory note for callers: the conversion runs after whatever
-    filtering the plot helper already does internally (e.g.
-    ``df[df["ProjectIdBSV"] == project_id]``), so the new column is
-    only as long as the rows the plot will actually consume. Callers
-    do not need to pre-convert upstream.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame the plot helper is about to consume.
-    plot_var : str
-        The energy column the caller declared in the plot call.
-    convert_from_energy_per_interval : pd.Timedelta, str, or None
-        Caller's explicit opt-in: the row spacing of ``plot_var``'s
-        per-interval energy values. Passed straight through to
-        ``convert_energy_per_interval_to_power``.
-    overrides : dict, optional
-        Caller's ``{col: unit}`` declarations. Forwarded unchanged on
-        the no-convert path; extended with the new column's display
-        unit on the convert path.
-    plot_type : str
-        Plot helper's name, used only for error messages.
-
-    Returns
-    -------
-    (pd.DataFrame, str, dict | None)
-        ``(working_df, working_col, working_overrides)`` -- the plot
-        helper should use these in place of ``(df, plot_var, overrides)``.
-    """
-    if convert_from_energy_per_interval is None:
-        return df, plot_var, overrides
-
-    src_unit = resolve_unit(plot_var, overrides=overrides)
-    assert_unit_in_classes(
-        src_unit, plot_var,
-        accepted_classes={"energy_per_interval"},
-        plot_type=f"{plot_type}.convert_from_energy_per_interval",
-        axis="conversion-source",
-    )
-
-    new_col = power_display_name(plot_var)
-    converted, display_unit = convert_energy_per_interval_to_power(
-        df[plot_var], plot_var, convert_from_energy_per_interval,
-        overrides=overrides,
-    )
-    overrides2: dict = dict(overrides) if overrides else {}
-    overrides2[new_col] = display_unit
-    return df.assign(**{new_col: converted}), new_col, overrides2
 
 
 def infer_interval_from_readingdate(

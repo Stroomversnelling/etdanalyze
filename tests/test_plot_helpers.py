@@ -33,7 +33,9 @@ class TestUnitLookup:
         assert unit_for_column("WarmteproductieWarmtepomp") == "GJ"
         assert unit_for_column("Gasgebruik") == "m3"
 
-    def test_diff_variant_inherits(self):
+    def test_diff_variant_has_explicit_row(self):
+        # Diff variants are explicit rows in etdmodel.csv (Diff='ja'),
+        # not synthesised from a name suffix.
         assert unit_for_column("ElektriciteitNetgebruikHoogDiff") == "kWh"
 
     def test_unknown_returns_empty(self):

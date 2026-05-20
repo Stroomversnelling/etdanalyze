@@ -12,10 +12,10 @@ import pytest
 
 from etdanalyze.units import (
     UNIT_CLASS,
-    apply_optional_energy_conversion,
     assert_unit_in_classes,
     convert_diff_to_power,
     convert_energy_per_interval_to_power,
+    convert_interval_diff,
     infer_interval,
     mean_per_row_to_period_total,
     power_display_name,
@@ -469,91 +469,83 @@ class TestToPerM2:
 
 
 # ---------------------------------------------------------------------------
-# apply_optional_energy_conversion
+# convert_interval_diff (the generic Diff -> longitudinal-sibling dispatcher)
 # ---------------------------------------------------------------------------
 
 
-class TestApplyOptionalEnergyConversion:
-    """The shared hook plot helpers use to opt-in to energy-per-interval
-    -> power conversion. The conversion math itself is in
-    ``convert_energy_per_interval_to_power``; these tests cover the
-    integration semantics: pass-through on None, source-class assertion,
-    no input mutation, overrides extended with the converted unit."""
+class TestConvertIntervalDiff:
+    """Generic dispatcher for converting interval-Diff variables to their
+    longitudinal-renderable sibling (ADR-003 of etdanalyze). Routes by
+    input unit to the converter registered in _INTERVAL_DIFF_CONVERTERS.
+    """
 
-    def test_none_kwarg_is_passthrough(self):
+    def test_single_column_kwh_returns_three_tuple(self):
         df = pd.DataFrame({
-            "ElektriciteitNetgebruikHoog": pd.Series([1.0], dtype="Float64"),
-        })
-        out_df, out_col, out_overrides = apply_optional_energy_conversion(
-            df, "ElektriciteitNetgebruikHoog", None, None,
-            plot_type="test_plot",
-        )
-        # df / col / overrides unchanged
-        assert out_df is df
-        assert out_col == "ElektriciteitNetgebruikHoog"
-        assert out_overrides is None
-
-    def test_kwh_input_yields_kw_column(self):
-        df = pd.DataFrame({
-            "ElektriciteitNetgebruikHoog": pd.Series(
+            "ElektriciteitNetgebruikHoogDiff": pd.Series(
                 [1.0, 2.0], dtype="Float64"
             ),
         })
-        out_df, out_col, out_overrides = apply_optional_energy_conversion(
-            df, "ElektriciteitNetgebruikHoog",
-            pd.Timedelta(hours=1), None,
-            plot_type="test_plot",
+        out_df, overrides, name_map = convert_interval_diff(
+            df, "ElektriciteitNetgebruikHoogDiff", interval="60min",
         )
-        assert out_col == "ElektriciteitNetgebruikHoog_kW"
-        assert out_col in out_df.columns
-        # 1 kWh / 1h = 1 kW
-        assert list(out_df[out_col]) == [1.0, 2.0]
-        assert out_overrides == {"ElektriciteitNetgebruikHoog_kW": "kW"}
+        assert name_map == {
+            "ElektriciteitNetgebruikHoogDiff": "ElektriciteitNetgebruikHoogDiff__kW",
+        }
+        new_col = name_map["ElektriciteitNetgebruikHoogDiff"]
+        assert new_col in out_df.columns
+        assert list(out_df[new_col]) == [1.0, 2.0]  # kWh / 1h = kW
+        assert overrides == {new_col: {"unit": "kW", "momentaan": True}}
+
+    def test_multi_column_independent_dispatch(self):
+        df = pd.DataFrame({
+            "ElektriciteitNetgebruikHoogDiff": pd.Series([1.0], dtype="Float64"),
+            "ElektriciteitNetgebruikLaagDiff": pd.Series([2.0], dtype="Float64"),
+        })
+        out_df, overrides, name_map = convert_interval_diff(
+            df,
+            "ElektriciteitNetgebruikHoogDiff",
+            "ElektriciteitNetgebruikLaagDiff",
+            interval="60min",
+        )
+        assert set(name_map) == {
+            "ElektriciteitNetgebruikHoogDiff",
+            "ElektriciteitNetgebruikLaagDiff",
+        }
+        for new_col in name_map.values():
+            assert new_col in out_df.columns
+            assert overrides[new_col] == {"unit": "kW", "momentaan": True}
+
+    def test_no_input_columns_raises(self):
+        with pytest.raises(ValueError, match="pass one or more"):
+            convert_interval_diff(pd.DataFrame(), interval="60min")
+
+    def test_unregistered_unit_raises_with_listing(self):
+        df = pd.DataFrame({
+            "GasgebruikDiff": pd.Series([1.0], dtype="Float64"),
+        })
+        # GasgebruikDiff is m3 in the data model; no converter registered yet.
+        with pytest.raises(ValueError, match="no converter registered for unit"):
+            convert_interval_diff(df, "GasgebruikDiff", interval="60min")
 
     def test_input_df_not_mutated(self):
         df = pd.DataFrame({
-            "ElektriciteitNetgebruikHoog": pd.Series([1.0], dtype="Float64"),
+            "ElektriciteitNetgebruikHoogDiff": pd.Series([1.0], dtype="Float64"),
         })
         cols_before = list(df.columns)
-        apply_optional_energy_conversion(
-            df, "ElektriciteitNetgebruikHoog",
-            pd.Timedelta(hours=1), None,
-            plot_type="test_plot",
+        convert_interval_diff(
+            df, "ElektriciteitNetgebruikHoogDiff", interval="60min",
         )
         assert list(df.columns) == cols_before
 
-    def test_rejects_non_energy_source(self):
+    def test_custom_new_name(self):
         df = pd.DataFrame({
-            "TemperatuurBuitenWeerstation": pd.Series([1.0], dtype="Float64"),
+            "ElektriciteitNetgebruikHoogDiff": pd.Series([1.0], dtype="Float64"),
         })
-        with pytest.raises(ValueError, match="not in the unit classes"):
-            apply_optional_energy_conversion(
-                df, "TemperatuurBuitenWeerstation",
-                pd.Timedelta(hours=1), None,
-                plot_type="test_plot",
-            )
-
-    def test_existing_overrides_preserved_and_extended(self):
-        df = pd.DataFrame({
-            "my_energy_var": pd.Series([1.0], dtype="Float64"),
-        })
-        overrides = {"my_energy_var": "kWh", "other_col": "graden C"}
-        _, _, out_overrides = apply_optional_energy_conversion(
-            df, "my_energy_var", pd.Timedelta(hours=1), overrides,
-            plot_type="test_plot",
+        out_df, overrides, name_map = convert_interval_diff(
+            df, "ElektriciteitNetgebruikHoogDiff",
+            interval="60min",
+            new_names={"ElektriciteitNetgebruikHoogDiff": "my_custom_col"},
         )
-        assert out_overrides["my_energy_var"] == "kWh"
-        assert out_overrides["other_col"] == "graden C"
-        assert out_overrides["my_energy_var_kW"] == "kW"
-        # Caller's dict not mutated
-        assert "my_energy_var_kW" not in overrides
-
-    def test_accepts_timedelta_string(self):
-        df = pd.DataFrame({
-            "ElektriciteitNetgebruikHoog": pd.Series([2.0], dtype="Float64"),
-        })
-        out_df, out_col, _ = apply_optional_energy_conversion(
-            df, "ElektriciteitNetgebruikHoog", "1h", None,
-            plot_type="test_plot",
-        )
-        assert list(out_df[out_col]) == [2.0]  # 2 kWh / 1h = 2 kW
+        assert name_map["ElektriciteitNetgebruikHoogDiff"] == "my_custom_col"
+        assert "my_custom_col" in out_df.columns
+        assert "my_custom_col" in overrides

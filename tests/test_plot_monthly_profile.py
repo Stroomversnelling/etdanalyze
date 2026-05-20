@@ -67,62 +67,55 @@ def test_missing_hours_filled():
     plt.close(fig)
 
 
-def test_rejects_energy_per_interval_unit():
-    """Layer 3 strict assertion: a monthly profile reads as an
-    instantaneous value at each (month, hour) cell; energy-per-interval
-    units (kWh / Wh / GJ) are NOT accepted -- callers wanting a power
-    view of an energy column must convert upstream into a new column
-    declared with a power unit. The helper raises ValueError describing
-    accepted unit classes."""
+def test_rejects_cumulative_meter():
+    """ADR-003 timeline gate: a cumulative meter reading (Cumulatief=ja)
+    is not longitudinally renderable -- the gate raises and points the
+    caller at the Diff variant."""
     df = _synthetic_hourly()
     df = df.rename(columns={_TEST_COL: "ElektriciteitNetgebruikHoog"})
-    with pytest.raises(ValueError, match="not in the unit classes"):
+    with pytest.raises(ValueError, match="cumulative meter reading"):
         plot_monthly_profile(df, "ElektriciteitNetgebruikHoog")
 
 
 def test_accepts_overridden_power_unit():
-    """A caller-derived kW column with overrides={col: 'kW'} passes the
-    Layer 3 assertion (power is an accepted class)."""
+    """A caller-derived kW column synthesised outside the data model
+    passes the gate when overrides declare both the unit (for labelling)
+    and momentaan=True (for the longitudinal gate, per ADR-003)."""
     import matplotlib.pyplot as plt
     df = _synthetic_hourly().rename(columns={_TEST_COL: "my_derived_kW"})
     fig = plot_monthly_profile(
         df, "my_derived_kW",
-        overrides={"my_derived_kW": "kW"},
+        overrides={"my_derived_kW": {"unit": "kW", "momentaan": True}},
     )
     assert isinstance(fig, plt.Figure)
     plt.close(fig)
 
 
-def test_convert_from_energy_per_interval_accepts_kwh():
-    """Caller opts in to energy-per-interval -> power conversion via the
-    new kwarg. The helper L3-asserts the source is energy_per_interval,
-    delegates to the shared conversion in etdanalyze.units, and the
-    plot succeeds with the derived power column. The input df is not
-    mutated (the new derived column appears only on the internal copy
-    used by the helper)."""
+def test_rejects_unconverted_diff_with_hint():
+    """Per ADR-003, plot helpers do not do conversion themselves. A
+    Diff variable passed directly raises with a hint to call
+    convert_interval_diff upstream."""
+    df = _synthetic_hourly().rename(columns={_TEST_COL: "ElektriciteitNetgebruikHoogDiff"})
+    with pytest.raises(ValueError, match="convert_interval_diff"):
+        plot_monthly_profile(df, "ElektriciteitNetgebruikHoogDiff")
+
+
+def test_accepts_converted_diff_via_overrides():
+    """After convert_interval_diff produces the converted column and
+    overrides, the plot accepts the new column directly."""
     import matplotlib.pyplot as plt
-    df = _synthetic_hourly().rename(columns={_TEST_COL: "ElektriciteitNetgebruikHoog"})
-    cols_before = list(df.columns)
+    from etdanalyze.units import convert_interval_diff
+    df = _synthetic_hourly().rename(columns={_TEST_COL: "ElektriciteitNetgebruikHoogDiff"})
+    df_conv, conv_overrides, name_map = convert_interval_diff(
+        df, "ElektriciteitNetgebruikHoogDiff", interval="60min",
+    )
     fig = plot_monthly_profile(
-        df, "ElektriciteitNetgebruikHoog",
-        convert_from_energy_per_interval=pd.Timedelta(hours=1),
+        df_conv,
+        name_map["ElektriciteitNetgebruikHoogDiff"],
+        overrides=conv_overrides,
     )
     assert isinstance(fig, plt.Figure)
     plt.close(fig)
-    assert list(df.columns) == cols_before, "Input df must not be mutated"
-
-
-def test_convert_from_energy_per_interval_rejects_non_energy_source():
-    """The opt-in kwarg requires the source column to resolve to an
-    energy-per-interval unit. Passing it for a temperature column is
-    a contract violation -- the helper raises ValueError describing
-    that the source must be in the energy_per_interval class."""
-    df = _synthetic_hourly()  # _TEST_COL is graden C (temperature)
-    with pytest.raises(ValueError, match="not in the unit classes"):
-        plot_monthly_profile(
-            df, _TEST_COL,
-            convert_from_energy_per_interval=pd.Timedelta(hours=1),
-        )
 
 
 def test_rejects_all_na_input():
