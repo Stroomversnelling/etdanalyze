@@ -1554,6 +1554,9 @@ def plot_monthly_profile(
         return fig
 
 
+_SCATTER_AUTO_THRESHOLD = 200
+
+
 def _draw_boxes(
         ax,
         plot_df: pd.DataFrame,
@@ -1567,14 +1570,30 @@ def _draw_boxes(
         outlier_ids: Optional[set],
         id_col: str,
         xtick_prefix: str = "",
+        scatter: str = "auto",
 ) -> None:
     """
-    Internal: draw boxes plus per-row scatter on a single axes. Used by
-    plot_boxwhisker_comparison for both single-axis and split-axis paths.
+    Internal: draw boxes plus optional scatter overlay on a single axes.
+    Used by plot_boxwhisker_comparison for both single-axis and
+    split-axis paths.
 
-    When outlier_ids is given, only rows whose id_col value is in the set are
-    overlaid as 'x' markers. Otherwise the whole population is jittered as
-    coloured dots (the original behaviour).
+    Scatter modes:
+
+    - ``"none"``: clean box-and-whisker, no markers.
+    - ``"matplotlib"``: native matplotlib fliers (1.5xIQR), drawn as
+      filled dots tinted to match each box's ``color_group`` value
+      when ``color_group == x_group`` (one box -> one colour).
+      Otherwise default style.
+    - ``"all"``: jitter every row of input as a coloured dot. Best at
+      small N per box; unusable when N is in the thousands.
+    - ``"auto"`` (default): pick ``"all"`` when N per box <= 200, else
+      ``"matplotlib"``. Tuned so per-HH stats inputs (~25-40 per box)
+      get the swarm and multi-year hourly inputs flip to coloured
+      native fliers.
+
+    When ``outlier_ids`` is given, it overrides ``scatter`` and
+    produces the caller-supplied 'x'-marker overlay (existing
+    behaviour).
     """
     x_pos = {cat: i for i, cat in enumerate(x_cats)}
 
@@ -1582,22 +1601,79 @@ def _draw_boxes(
         plot_df[plot_df[x_group] == cat][value_col].dropna().values
         for cat in x_cats
     ]
-    ax.boxplot(
+
+    use_caller_outliers = (
+        outlier_ids is not None and id_col in plot_df.columns
+    )
+
+    effective_scatter = scatter
+    if use_caller_outliers:
+        effective_scatter = "_caller_outliers"
+    elif scatter == "auto":
+        max_per_box = max((len(d) for d in box_data), default=0)
+        effective_scatter = "all" if max_per_box <= _SCATTER_AUTO_THRESHOLD else "matplotlib"
+
+    # Filled-dot fliers in "matplotlib" mode; everything else
+    # suppresses native fliers (custom overlay below, or nothing).
+    if effective_scatter == "matplotlib":
+        flierprops = dict(marker="o", markersize=4, linestyle="none")
+    else:
+        flierprops = dict(marker="none")
+
+    bp = ax.boxplot(
         box_data,
         positions=range(len(x_cats)),
         widths=0.45,
         patch_artist=True,
         medianprops=dict(color="black", linewidth=1.8),
         boxprops=dict(facecolor="whitesmoke", alpha=0.7),
-        flierprops=dict(marker="none"),
+        flierprops=flierprops,
         whiskerprops=dict(linewidth=1.0, color="grey"),
         capprops=dict(linewidth=1.0, color="grey"),
     )
 
-    legend_added = set()
-    if outlier_ids is not None and id_col in plot_df.columns:
-        # Outlier-only overlay: 'x' markers, no whole-population scatter.
-        ids = set(outlier_ids)
+    legend_added: set = set()
+
+    if effective_scatter == "matplotlib":
+        # Tint native fliers per box. Each box maps to one x_cat;
+        # translate that to its color_group value via the data (1:1
+        # in the typical case where the colouring varies with the
+        # x-position). Boxes whose x_cat has no resolvable colour
+        # fall back to default flier style.
+        if x_group == color_group:
+            x_to_c = {x: x for x in x_cats}
+        else:
+            x_to_c = (
+                plot_df[[x_group, color_group]]
+                .drop_duplicates(subset=[x_group])
+                .set_index(x_group)[color_group]
+                .to_dict()
+            )
+        for x_cat, flier in zip(x_cats, bp.get("fliers", [])):
+            color = c_colors.get(x_to_c.get(x_cat))
+            if color is None:
+                continue
+            flier.set_markerfacecolor(color)
+            flier.set_markeredgecolor(color)
+            flier.set_alpha(0.75)
+            # Jitter the flier x-coordinates so overlapping outliers
+            # don't stack into one indistinguishable dot. Matplotlib
+            # places every flier at the box's centre x by default;
+            # replacing xdata with pos +/- uniform jitter spreads
+            # them across the box width without changing y-values.
+            y_data = flier.get_ydata()
+            if len(y_data) == 0:
+                continue
+            pos = x_pos[x_cat]
+            flier.set_xdata(pos + rng.uniform(-0.18, 0.18, len(y_data)))
+        # Legend proxies so the swatch-by-group key still renders.
+        for c_cat in c_cats:
+            ax.plot(
+                [], [], marker="o", linestyle="",
+                color=c_colors[c_cat], label=str(c_cat),
+            )
+    elif effective_scatter == "_caller_outliers":
+        ids = set(outlier_ids or [])
         outlier_df = plot_df[plot_df[id_col].isin(ids)]
         for c_cat in c_cats:
             c_df = outlier_df[outlier_df[color_group] == c_cat]
@@ -1607,15 +1683,14 @@ def _draw_boxes(
                     continue
                 jitter = rng.uniform(-0.18, 0.18, len(vals))
                 label = str(c_cat) if c_cat not in legend_added else "_nolegend_"
-                if c_cat not in legend_added:
-                    legend_added.add(c_cat)
+                legend_added.add(c_cat)
                 ax.scatter(
                     x_pos[x_cat] + jitter, vals,
                     color=c_colors[c_cat],
                     marker="x", s=60, linewidths=1.5, alpha=0.9, zorder=5,
                     label=label,
                 )
-    else:
+    elif effective_scatter == "all":
         for c_cat in c_cats:
             c_df = plot_df[plot_df[color_group] == c_cat]
             for x_cat in x_cats:
@@ -1624,14 +1699,20 @@ def _draw_boxes(
                     continue
                 jitter = rng.uniform(-0.22, 0.22, len(vals))
                 label = str(c_cat) if c_cat not in legend_added else "_nolegend_"
-                if c_cat not in legend_added:
-                    legend_added.add(c_cat)
+                legend_added.add(c_cat)
                 ax.scatter(
                     x_pos[x_cat] + jitter, vals,
                     color=c_colors[c_cat],
                     alpha=0.65, s=22, linewidths=0,
                     label=label, zorder=3,
                 )
+    elif effective_scatter == "none":
+        pass
+    else:
+        raise ValueError(
+            f"_draw_boxes: unknown scatter mode {scatter!r}. Expected one "
+            f"of: 'none', 'matplotlib', 'all', 'auto'."
+        )
 
     ax.set_xticks(range(len(x_cats)))
     ax.set_xticklabels(
@@ -1641,10 +1722,10 @@ def _draw_boxes(
 
 
 DEFAULT_BOXWHISKER_TITLE_TPL = (
-    "per-huishouden {value_col}: {variable}{unit_paren} per {x_group}"
+    "{per_grouping} {value_col}: {variable}{unit_paren} per {x_group}"
 )
 DEFAULT_BOXWHISKER_YLABEL_TPL = (
-    "per-huishouden {value_col} -- {variable}{unit_paren}"
+    "{per_grouping} {value_col} -- {variable}{unit_paren}"
 )
 
 
@@ -1668,6 +1749,8 @@ def plot_boxwhisker_comparison(
         secondary_axis_label: Optional[str] = None,
         secondary_axis_value_col: Optional[str] = None,
         xtick_prefix: str = "",
+        scatter: str = "auto",
+        grouping_col: Optional[str] = None,
 ) -> Optional[plt.Figure]:
     """
     Box-and-whisker plot with jittered scatter overlay for distribution
@@ -1711,15 +1794,20 @@ def plot_boxwhisker_comparison(
             ``""`` if unitless. Use this in default-style templates
             so unitless variables don't render dangling ``()``.
           - ``{value_col}``, ``{x_group}``: as named.
+          - ``{per_grouping}``: "per <unit>" phrase resolved from
+            ``grouping_col`` via ``etdanalyze.grouping`` (e.g.
+            "per huishouden", "per weerstation").
+          - ``{grouping_singular}``: bare singular noun matching
+            ``{per_grouping}`` (e.g. "huishouden", "weerstation").
           - any keys in ``title_params``.
-        Default: ``"per-huishouden {value_col}: {variable}{unit_paren} per {x_group}"``.
+        Default: ``"{per_grouping} {value_col}: {variable}{unit_paren} per {x_group}"``.
         STRICT CONTRACT: when ``column_name`` is given the helper owns
         the unit -- do NOT pre-stamp a unit suffix in the template
         text. Pre-stamping plus ``{unit_paren}`` produces a visibly
         doubled unit, which is the loud failure mode by design.
     y_label : str, optional
         Y-axis label TEMPLATE. Same placeholders as ``title``.
-        Default: ``"per-huishouden {value_col} -- {variable}{unit_paren}"``.
+        Default: ``"{per_grouping} {value_col} -- {variable}{unit_paren}"``.
     title_params : dict, optional
         Extra named values for the title / y_label templates (e.g.
         ``{"period": "year"}`` to enable ``"... - {period}"`` in your
@@ -1755,6 +1843,28 @@ def plot_boxwhisker_comparison(
         Y-axis label for the secondary subplot.
     secondary_axis_value_col : str, optional
         Column in secondary_axis_data holding the secondary-axis values.
+    scatter : str, default "auto"
+        Scatter-overlay mode on top of the boxes. One of:
+          - ``"none"``: no markers; just boxes and whiskers.
+          - ``"matplotlib"``: native matplotlib fliers (1.5xIQR),
+            drawn as filled dots and tinted to match each box's
+            ``color_group`` value when ``color_group == x_group``.
+          - ``"all"``: jitter every row of input as a coloured dot.
+            Best at small N per box.
+          - ``"auto"`` (default): ``"all"`` when N per box <= 200,
+            else ``"matplotlib"``. Per-HH inputs (~25-40 per box)
+            get the swarm; multi-year hourly inputs flip to coloured
+            native fliers.
+        Overridden by ``outlier_ids`` when caller supplies it.
+    grouping_col : str, optional
+        Column describing what unit each row represents (e.g.
+        ``"HuisIdBSV"`` for per-huishouden stats, ``"WeerstationGroep"``
+        for per-weerstation hourly readings). Drives the
+        ``{per_grouping}`` / ``{grouping_singular}`` placeholders in
+        the default title and y-label templates via
+        :mod:`etdanalyze.grouping`. Defaults to ``id_col``
+        (``"HuisIdBSV"``) so existing per-HH callers keep their
+        historic phrasing unchanged.
 
     Returns
     -------
@@ -1802,12 +1912,23 @@ def plot_boxwhisker_comparison(
         variable = value_col
     unit_paren = f" ({unit})" if unit else ""
 
+    # Resolve the "per X" phrase for the default templates. The
+    # grouping column describes the unit each row represents:
+    # ``"HuisIdBSV"`` -> "per huishouden", ``"WeerstationGroep"`` ->
+    # "per weerstation", etc. Defaults to id_col so existing per-HH
+    # callers keep the historic phrasing unchanged.
+    from etdanalyze.grouping import label_for_grouping
+    effective_grouping = grouping_col or id_col
+    grouping_meta = label_for_grouping(effective_grouping)
+
     fmt_params = {
-        "variable":   variable,
-        "unit":       unit,
-        "unit_paren": unit_paren,
-        "value_col":  value_col,
-        "x_group":    x_group,
+        "variable":          variable,
+        "unit":              unit,
+        "unit_paren":        unit_paren,
+        "value_col":         value_col,
+        "x_group":           x_group,
+        "per_grouping":      grouping_meta["per_phrase"],
+        "grouping_singular": grouping_meta["singular"],
         **(title_params or {}),
     }
     title_tpl   = title   if title   is not None else DEFAULT_BOXWHISKER_TITLE_TPL
@@ -1820,7 +1941,8 @@ def plot_boxwhisker_comparison(
             f"plot_boxwhisker_comparison: title/y_label template references "
             f"placeholder {missing!s} which is not in title_params nor in "
             f"the auto-filled placeholders {{variable}}, {{unit}}, "
-            f"{{unit_paren}}, {{value_col}}, {{x_group}}. Pass it via "
+            f"{{unit_paren}}, {{value_col}}, {{x_group}}, "
+            f"{{per_grouping}}, {{grouping_singular}}. Pass it via "
             f"title_params={{...}}."
         ) from None
 
@@ -1850,7 +1972,7 @@ def plot_boxwhisker_comparison(
     _draw_boxes(
         ax, plot_df, value_col, x_group, color_group,
         x_cats, c_cats, c_colors, rng, outlier_ids, id_col,
-        xtick_prefix=xtick_prefix,
+        xtick_prefix=xtick_prefix, scatter=scatter,
     )
     # wrap=True is the default; matplotlib's ax.set_title(wrap=True) wraps
     # to figure width; y-axis labels need textwrap.fill (set_ylabel's
