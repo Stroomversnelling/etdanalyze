@@ -65,17 +65,84 @@ _UNIT_MAP = load_unit_map()
 # ---------------------------------------------------------------------------
 
 
+# Allowed values for the per-call override's ``type`` slot. See ADR-003.
+# The first three mirror etdmap's mutually exclusive classifier columns
+# (Cumulatief / Momentaan / Diff). ``interval_mean`` is the analysis-side
+# derived category produced by ``convert_interval_diff`` and equivalent
+# helpers; not present in etdmap.
+_VALID_TYPE_VALUES: frozenset = frozenset(
+    {"cumulatief", "momentaan", "diff", "interval_mean"}
+)
+# Allowed keys in the nested-override dict. Anything else raises -- the
+# strict schema is the boundary the rest of the module trusts.
+_VALID_NESTED_KEYS: frozenset = frozenset({"unit", "type"})
+# Legacy boolean keys that the previous override shape supported. Now
+# forbidden; intercepted at the boundary with a hint pointing to the
+# unified ``type`` slot. See ADR-003.
+_FORBIDDEN_LEGACY_KEYS: frozenset = frozenset(
+    {"momentaan", "cumulatief", "diff", "aggregatie_methode"}
+)
+
+
+def _validate_nested_override(col_name: str, val: dict) -> None:
+    """Raise ``ValueError`` if the nested-override dict for ``col_name``
+    violates the schema declared in ADR-003.
+
+    Two failure modes get tailored hints so the operator does not have to
+    re-read the ADR to fix a stale call:
+
+    - A legacy boolean key (``momentaan`` / ``cumulatief`` / ``diff`` /
+      ``aggregatie_methode``) is present. Caller is on the pre-ADR-003
+      shape; the message names the new ``type`` slot.
+    - The ``type`` value is not one of the four allowed enum strings.
+    """
+    legacy = _FORBIDDEN_LEGACY_KEYS & val.keys()
+    if legacy:
+        bad = ", ".join(repr(k) for k in sorted(legacy))
+        raise ValueError(
+            f"Override for {col_name!r} uses legacy key(s) {bad}. "
+            f"The override schema now has a single 'type' slot whose "
+            f"value is one of {sorted(_VALID_TYPE_VALUES)}. See "
+            f"etdanalyze/DECISIONS.md ADR-003 for the schema and the "
+            f"migration path."
+        )
+    extras = val.keys() - _VALID_NESTED_KEYS
+    if extras:
+        bad = ", ".join(repr(k) for k in sorted(extras))
+        raise ValueError(
+            f"Override for {col_name!r} has unknown key(s) {bad}. "
+            f"Allowed keys: {sorted(_VALID_NESTED_KEYS)}. See "
+            f"etdanalyze/DECISIONS.md ADR-003."
+        )
+    if "type" in val and val["type"] not in _VALID_TYPE_VALUES:
+        raise ValueError(
+            f"Override for {col_name!r} has type {val['type']!r}; "
+            f"allowed values are {sorted(_VALID_TYPE_VALUES)}. See "
+            f"etdanalyze/DECISIONS.md ADR-003."
+        )
+
+
 def _override_field(overrides: "Optional[dict]", col_name: str, field: str):
-    """Return overrides[col_name][field] when overrides uses the nested
-    shape ``{col: {"unit"|"momentaan"|"cumulatief"|"aggregatie_methode": ...}}``.
+    """Return ``overrides[col_name][field]`` when ``overrides`` uses the
+    nested shape ``{col: {"unit": ..., "type": ...}}``.
 
     Returns ``None`` when the override is absent or uses the plain
-    ``{col: unit_str}`` shape (which only carries the unit, no metadata).
+    ``{col: unit_str}`` shape (which only carries the unit, no
+    classification).
+
+    The nested dict is validated against the ADR-003 schema on every
+    read: unknown keys or a legacy boolean key (``momentaan`` /
+    ``cumulatief`` / ``diff`` / ``aggregatie_methode``) raise
+    ``ValueError`` with a pointer to the new ``type`` slot. Validation
+    runs on the dict the caller passes in, so the cost is one schema
+    check per override read -- negligible relative to plot/aggregation
+    work.
     """
     if overrides is None or col_name not in overrides:
         return None
     val = overrides[col_name]
     if isinstance(val, dict):
+        _validate_nested_override(col_name, val)
         return val.get(field)
     return None
 
@@ -89,14 +156,17 @@ def _resolve_input_unit(col_name: str, overrides: Optional[dict]) -> str:
     by either passing an override or registering the column in the data
     model.
 
-    Override shapes both supported:
+    Override shapes both supported (see ADR-003):
+
     - plain ``{col: "kW"}`` -- unit only.
-    - nested ``{col: {"unit": "kW", "momentaan": True}}`` -- unit plus
-      timeline-renderability metadata (see ADR-003).
+    - nested ``{col: {"unit": "kW", "type": "interval_mean"}}`` --
+      unit plus variable-type classification. The nested dict is
+      schema-validated; legacy boolean keys raise.
     """
     if overrides is not None and col_name in overrides:
         val = overrides[col_name]
         if isinstance(val, dict):
+            _validate_nested_override(col_name, val)
             if "unit" in val:
                 return val["unit"]
             # Nested dict without a "unit" key falls through to data model.
@@ -206,101 +276,80 @@ def assert_unit_in_classes(
 
 
 # ---------------------------------------------------------------------------
-# Metadata predicates and timeline-renderability gate.
+# Variable-type resolver and profile-renderability gate (ADR-003).
 #
-# These are the Layer 3 check for *profile* plots (anything where the
-# x-axis is time-of-day, day-of-week, day-of-year, or a heatmap of those
+# The Layer 3 check for *profile* plots (anything where the x-axis is
+# time-of-day, day-of-week, day-of-year, or a heatmap of those
 # combinations). The check is metadata-driven: it asks the data model
-# whether each variable is an instantaneous reading. The unit class is
-# irrelevant -- a Momentaan=ja variable in any unit is renderable on a
-# timeline, whether it's degrees, ppm, J/cm2, or anything else.
+# AND any per-call override which of the four classifications the
+# variable belongs to (cumulatief / momentaan / diff / interval_mean)
+# and admits the two that are interval-cadence-independent on a
+# time axis (momentaan, interval_mean). The unit class is irrelevant
+# -- a momentaan variable in any unit is renderable on a timeline,
+# whether it's degrees, ppm, J/cm2, or anything else.
 #
 # Physics-specific plots (plot_energy_signature, plot_cop_vs_temp,
-# plot_cop_vs_delta_t) keep the UNIT_CLASS check because they require a
-# specific physical quantity on each axis, not just instantaneous-ness.
+# plot_cop_vs_delta_t) keep the UNIT_CLASS check because they require
+# a specific physical quantity on each axis, not just renderability.
 # ---------------------------------------------------------------------------
 
 
-def _bool_truthy(value) -> bool:
-    """Coerce an override choice value to a Python bool, strictly.
+def variable_type(col_name: str, overrides: Optional[dict] = None) -> Optional[str]:
+    """Return the column's classification, one of ``_VALID_TYPE_VALUES``,
+    or ``None`` if neither overrides nor etdmap classifies the column.
 
-    Accepts exactly:
-    - ``True`` / ``False`` (Python bool)
-    - ``"ja"`` / ``"nee"`` (strict -- matches the Grist choice field
-      values, no lowercasing of arbitrary input).
+    Lookup order (ADR-003):
 
-    Anything else raises ``ValueError``. Override values come from
-    application code, but the choice contract is the same as the data
-    model's (ADR-003): sloppy free-text would defeat the gate.
+    1. Override slot ``overrides[col]["type"]``. The value is validated
+       against ``_VALID_TYPE_VALUES`` at the boundary via
+       :func:`_validate_nested_override`; a bad value raises rather than
+       silently passing through.
+    2. Membership in the three mutually exclusive etdmap classifier
+       lists (``momentaan_columns``, ``cumulative_columns``,
+       ``diff_columns``). Returns the matching Dutch enum string
+       (``"momentaan"`` / ``"cumulatief"`` / ``"diff"``).
+    3. ``None`` -- the column is not in etdmap and the override does
+       not classify it. Callers decide what that means (often:
+       conservative refusal at a gate, or pass-through where
+       classification is not required).
+
+    Note that ``"interval_mean"`` is reachable only via override --
+    etdmap does not declare it. ``convert_interval_diff`` and similar
+    helpers stamp the produced column's override with this value.
     """
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        if value == "ja":
-            return True
-        if value == "nee":
-            return False
-    raise ValueError(
-        f"choice override must be True / False / 'ja' / 'nee', got "
-        f"{type(value).__name__}: {value!r}"
-    )
-
-
-def is_momentaan(col_name: str, overrides: Optional[dict] = None) -> bool:
-    """True when the column is declared instantaneous (``Momentaan='ja'``).
-
-    Lookup order: ``overrides[col]["momentaan"]`` -> membership in
-    ``etdmap.data_model.momentaan_columns`` -> ``False``. An override
-    value can be a Python bool or one of the model's ``"ja"``/``"nee"``
-    strings; anything else raises (see ``_bool_truthy``).
-    """
-    ov = _override_field(overrides, col_name, "momentaan")
+    ov = _override_field(overrides, col_name, "type")
     if ov is not None:
-        return _bool_truthy(ov)
-    return col_name in momentaan_columns
+        return ov
+    if col_name in momentaan_columns:
+        return "momentaan"
+    if col_name in cumulative_columns:
+        return "cumulatief"
+    if col_name in diff_columns:
+        return "diff"
+    return None
 
 
-def is_cumulatief(col_name: str, overrides: Optional[dict] = None) -> bool:
-    """True when the column is a running-total meter reading (``Cumulatief='ja'``).
+def is_renderable_on_profile(
+    col_name: str, overrides: Optional[dict] = None,
+) -> bool:
+    """True iff ``col_name`` can be plotted on a profile (time-axis)
+    without the recording cadence muddying the y-axis.
 
-    Cumulative readings are never plottable on a profile -- their values
-    monotonically increase regardless of the underlying phenomenon. Plot
-    the corresponding Diff variant instead, which represents per-row
-    delta. Membership-checked against
-    ``etdmap.data_model.cumulative_columns``.
+    The renderable set is the two variable types whose values are
+    interval-cadence-independent in their numbers (ADR-003):
+
+    - ``"momentaan"`` -- instantaneous sample at the row's timestamp.
+    - ``"interval_mean"`` -- rate over the row's interval (e.g. kW
+      from a kWh-Diff, m3 / uur from a volume-Diff). Numerically
+      independent of cadence because the per-row magnitude has
+      already been divided through by interval length.
+
+    ``"cumulatief"`` (monotonically increasing meter) and ``"diff"``
+    (raw cadence-dependent delta) return False. A column whose
+    classification is unknown (``variable_type`` returns ``None``)
+    also returns False -- the gate is conservative when in doubt.
     """
-    ov = _override_field(overrides, col_name, "cumulatief")
-    if ov is not None:
-        return _bool_truthy(ov)
-    return col_name in cumulative_columns
-
-
-def is_diff_variable(col_name: str, overrides: Optional[dict] = None) -> bool:
-    """True when the column is a dataset-cadence delta (``Diff='ja'``).
-
-    Diff variables are interval deltas of cumulative meter readings --
-    e.g. ``ElektriciteitNetgebruikLaagDiff`` is the per-5-min kWh delta
-    of ``ElektriciteitNetgebruikLaag``. Their raw values depend on row
-    cadence, so they are not directly renderable on time profiles.
-    Conversion to an instantaneous-style sibling (e.g. kWh-per-row ->
-    kW) requires a unit-aware converter -- see
-    ``assert_renderable_on_timeline`` for the available conversion paths
-    and what to do when none exists for a variable's unit.
-
-    The ``Diff`` column in the data model is the authoritative signal --
-    not the variable-name suffix. Membership-checked against
-    ``etdmap.data_model.diff_columns``. Several Diff variables (e.g.
-    ``TerugleveringTotaalNetto``, ``Netuitwisseling``) do not carry the
-    suffix in their name but are still deltas; their explicit
-    ``Diff="ja"`` row puts them in the list.
-
-    Per-call override: ``overrides={col: {"diff": True}}`` for synthetic
-    columns.
-    """
-    ov = _override_field(overrides, col_name, "diff")
-    if ov is not None:
-        return _bool_truthy(ov)
-    return col_name in diff_columns
+    return variable_type(col_name, overrides) in ("momentaan", "interval_mean")
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +522,13 @@ def convert_interval_diff(
             new_name=new_names.get(col),
         )
         attachments[new_name] = converted
-        out_overrides[new_name] = {"unit": display_unit, "momentaan": True}
+        # ADR-003: the produced column is an interval-mean rate (kW for
+        # kWh-Diff input, m3 / uur for volume-Diff input). It is NOT
+        # Momentaan -- the values are arithmetic means over each row's
+        # interval, not instantaneous samples. The 'type' slot is the
+        # single classification axis; downstream gates pick it up via
+        # variable_type / is_renderable_on_profile.
+        out_overrides[new_name] = {"unit": display_unit, "type": "interval_mean"}
         name_map[col] = new_name
     out_df = df.assign(**attachments)
     return out_df, out_overrides, name_map
@@ -486,29 +541,32 @@ def assert_renderable_on_timeline(
     plot_type: str = "<plot>",
     axis: str = "y",
 ) -> None:
-    """Raise ``ValueError`` if ``col_name`` cannot be plotted on a time profile.
+    """Raise ``ValueError`` if ``col_name`` cannot be plotted on a time
+    profile. The profile-plot gate (ADR-003).
 
-    A column is renderable on a timeline when its data-model metadata
-    declares it instantaneous (``Momentaan='ja'``), or a per-call
-    override declares it so.
+    Renderable variables are those whose values are interval-cadence-
+    independent on a time axis: ``"momentaan"`` (instantaneous sample)
+    and ``"interval_mean"`` (rate over the row's interval, e.g. kW
+    from kWh-Diff). Anything else raises with a tailored hint:
 
-    Two specific failure modes surface with tailored hints:
-
-    - ``Cumulatief='ja'``: cumulative meter reading. Plot the
-      corresponding Diff variant.
-    - ``Diff='ja'``: dataset-cadence delta. Call
-      :func:`convert_interval_diff` upstream of the plot to convert it
-      to an instantaneous sibling, then pass the new column name plus
-      the returned overrides to the plot helper.
+    - ``"cumulatief"`` -- meter reading. Plot the Diff variant.
+    - ``"diff"`` -- raw cadence-dependent delta. Call
+      :func:`convert_interval_diff` upstream to produce a rate
+      column whose override carries ``type="interval_mean"``.
+    - ``None`` (unclassified) -- the column is not in etdmap and the
+      override does not classify it. Caller must either register the
+      column in ``etdmodel.csv`` or pass an override with the right
+      ``type`` slot.
 
     Parameters
     ----------
     col_name : str
-        Column name being plotted; looked up in the data model first.
+        Column name being plotted; classification looked up via
+        :func:`variable_type`.
     overrides : dict, optional
         Per-call overrides. Plain ``{col: "kW"}`` covers unit only;
-        nested ``{col: {"unit": "kW", "momentaan": True}}`` adds the
-        timeline-renderability flag for synthetic columns.
+        nested ``{col: {"unit": "kW", "type": "interval_mean"}}``
+        declares both unit and variable-type. See ADR-003.
     plot_type : str
         Name of the calling plot helper. Used in error messages.
     axis : str
@@ -517,13 +575,12 @@ def assert_renderable_on_timeline(
     Raises
     ------
     ValueError
-        The column is not renderable: it is cumulative, an unconverted
-        Diff, or has no Momentaan flag in the data model and no
-        override declaring it instantaneous.
+        The column is not renderable on a profile per the rules above.
     """
-    if is_momentaan(col_name, overrides):
+    vt = variable_type(col_name, overrides)
+    if vt in ("momentaan", "interval_mean"):
         return
-    if is_cumulatief(col_name, overrides):
+    if vt == "cumulatief":
         raise ValueError(
             f"{plot_type}: {axis} column {col_name!r} is a cumulative meter "
             f"reading (Cumulatief=ja). Cumulative readings are not "
@@ -531,7 +588,7 @@ def assert_renderable_on_timeline(
             f"increase regardless of the underlying phenomenon. Plot the "
             f"corresponding Diff variant instead."
         )
-    if is_diff_variable(col_name, overrides):
+    if vt == "diff":
         unit = ""
         try:
             unit = _resolve_input_unit(col_name, overrides)
@@ -554,13 +611,16 @@ def assert_renderable_on_timeline(
             f"Add a converter in etdanalyze.units (register in "
             f"_INTERVAL_DIFF_CONVERTERS) before plotting."
         )
+    # variable_type returned None -- not in etdmap and no override.
     raise ValueError(
-        f"{plot_type}: {axis} column {col_name!r} has no Momentaan flag in "
-        f"the data model and no per-call override declares it instantaneous. "
-        f"Set Momentaan=ja in etdmodel.csv (Grist source of truth) if the "
-        f"column belongs in the data model, or pass "
-        f"overrides={{{col_name!r}: {{'momentaan': True}}}} for a synthetic "
-        f"column."
+        f"{plot_type}: {axis} column {col_name!r} has no classification "
+        f"in etdmap (no Cumulatief / Momentaan / Diff flag) and no "
+        f"per-call override declares its type. Add the column to "
+        f"etdmodel.csv (Grist source of truth) with the right ja/nee "
+        f"flag, or pass "
+        f"overrides={{{col_name!r}: {{'unit': '<unit>', 'type': "
+        f"'momentaan'|'interval_mean'}}}} when the column is synthetic. "
+        f"See etdanalyze/DECISIONS.md ADR-003."
     )
 
 

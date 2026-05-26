@@ -8,6 +8,110 @@ from ibis import _
 from ibis.expr.types import Table
 
 
+def build_distribution_table(
+    df: pd.DataFrame,
+    value_col: str,
+    *,
+    period_col: str = "period",
+    group_cols: tuple[str, ...] = ("ProjectIdBSV", "WoningType"),
+    periods: tuple[str, ...] = ("year", "verwarmingsperiode", "koelingsperiode"),
+    population_label: str = "alle HHs",
+) -> pd.DataFrame:
+    """Build a report-ready distribution table for one numeric value column.
+
+    Shape::
+
+        period | <group_cols...> | n | gem. | med. | p25 | p75 | min | max
+        year                     | <project> | <woningtype> | ...
+        verwarmingsperiode       | <project> | <woningtype> | ...
+        koelingsperiode          | <project> | <woningtype> | ...
+        year                     | alle HHs  |              | <population roll-up>
+        ...
+
+    Rows are stacked by period within each ``group_cols`` tuple so the
+    seasonal profile for a single (project, woningtype) sits in
+    consecutive lines. A trailing ``population_label`` roll-up row per
+    period summarises across every household in the input frame.
+
+    The function does not render markdown -- it returns a tidy
+    DataFrame whose columns are already named for stakeholder reading
+    (``gem.`` / ``med.`` / ``n`` rather than ``mean`` / ``median`` /
+    ``count``). Callers typically pipe through ``df.to_markdown()``.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Per-HH frame: one row per (HuisIdBSV, *, period). Must contain
+        ``value_col``, ``period_col``, and every entry in ``group_cols``.
+    value_col : str
+        The metric to aggregate per (group, period). Stored as a single
+        value per row; the function takes the mean / median / quartiles
+        / count across HHs in each group.
+    period_col : str
+        Column carrying the period label (default ``"period"``).
+    group_cols : tuple[str, ...]
+        Grouping levels above ``period``. Two columns is the common
+        case (project + woningtype); the helper is variadic and adapts
+        to other shapes (e.g. (``"Dataleverancier"``,)).
+    periods : tuple[str, ...]
+        Period labels in display order. Rows for periods not in this
+        tuple are dropped before aggregation.
+    population_label : str
+        Value placed in the first ``group_cols`` column for the
+        population roll-up rows (default ``"alle HHs"``).
+
+    Returns
+    -------
+    pd.DataFrame
+        Ready to render via ``.to_markdown(index=False)``.
+    """
+    cols_out = [period_col, *group_cols, "n", "gem.", "med.", "p25", "p75", "min", "max"]
+    sub = df.loc[df[period_col].isin(periods)].copy()
+    if sub.empty:
+        return pd.DataFrame(columns=cols_out)
+
+    grouped = sub.groupby([*group_cols, period_col], observed=True, dropna=False)
+    per_group = pd.DataFrame({
+        "n":    grouped[value_col].count().astype("Int64"),
+        "gem.": grouped[value_col].mean(),
+        "med.": grouped[value_col].median(),
+        "p25":  grouped[value_col].quantile(0.25),
+        "p75":  grouped[value_col].quantile(0.75),
+        "min":  grouped[value_col].min(),
+        "max":  grouped[value_col].max(),
+    }).reset_index()
+
+    period_order = {p: i for i, p in enumerate(periods)}
+    per_group["_p_ord"] = per_group[period_col].map(period_order)
+    per_group = per_group.sort_values(
+        [*group_cols, "_p_ord"], kind="stable",
+    ).drop(columns=["_p_ord"])
+
+    rollup_rows: list[dict] = []
+    for p in periods:
+        pwp = sub.loc[sub[period_col] == p, value_col]
+        if pwp.empty:
+            continue
+        row = {period_col: p}
+        # First group column carries the population label; the rest are blank.
+        for i, g in enumerate(group_cols):
+            row[g] = population_label if i == 0 else ""
+        row.update({
+            "n":    int(pwp.count()),
+            "gem.": float(pwp.mean()),
+            "med.": float(pwp.median()),
+            "p25":  float(pwp.quantile(0.25)),
+            "p75":  float(pwp.quantile(0.75)),
+            "min":  float(pwp.min()),
+            "max":  float(pwp.max()),
+        })
+        rollup_rows.append(row)
+    if rollup_rows:
+        per_group = pd.concat([per_group, pd.DataFrame(rollup_rows)], ignore_index=True)
+
+    return per_group[cols_out]
+
+
 def sort_load(series: pd.Series) -> pd.Series:
     """
     Sort a Series in descending order and reset the index.

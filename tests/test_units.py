@@ -17,10 +17,12 @@ from etdanalyze.units import (
     convert_energy_per_interval_to_power,
     convert_interval_diff,
     infer_interval,
+    is_renderable_on_profile,
     mean_per_row_to_period_total,
     power_display_name,
     resolve_unit,
     to_per_m2,
+    variable_type,
     _resolve_input_unit,
 )
 
@@ -494,7 +496,7 @@ class TestConvertIntervalDiff:
         new_col = name_map["ElektriciteitNetgebruikHoogDiff"]
         assert new_col in out_df.columns
         assert list(out_df[new_col]) == [1.0, 2.0]  # kWh / 1h = kW
-        assert overrides == {new_col: {"unit": "kW", "momentaan": True}}
+        assert overrides == {new_col: {"unit": "kW", "type": "interval_mean"}}
 
     def test_multi_column_independent_dispatch(self):
         df = pd.DataFrame({
@@ -513,7 +515,7 @@ class TestConvertIntervalDiff:
         }
         for new_col in name_map.values():
             assert new_col in out_df.columns
-            assert overrides[new_col] == {"unit": "kW", "momentaan": True}
+            assert overrides[new_col] == {"unit": "kW", "type": "interval_mean"}
 
     def test_no_input_columns_raises(self):
         with pytest.raises(ValueError, match="pass one or more"):
@@ -521,11 +523,16 @@ class TestConvertIntervalDiff:
 
     def test_unregistered_unit_raises_with_listing(self):
         df = pd.DataFrame({
-            "GasgebruikDiff": pd.Series([1.0], dtype="Float64"),
+            "MyExoticDiff": pd.Series([1.0], dtype="Float64"),
         })
-        # GasgebruikDiff is m3 in the data model; no converter registered yet.
+        # Force-declare an input unit that has no registered converter.
+        # ("J/cm2" is unitless on the irradiance axis from the data model
+        # perspective but no Diff converter exists for it.)
         with pytest.raises(ValueError, match="no converter registered for unit"):
-            convert_interval_diff(df, "GasgebruikDiff", interval="60min")
+            convert_interval_diff(
+                df, "MyExoticDiff", interval="60min",
+                overrides={"MyExoticDiff": "J/cm2"},
+            )
 
     def test_input_df_not_mutated(self):
         df = pd.DataFrame({
@@ -549,3 +556,98 @@ class TestConvertIntervalDiff:
         assert name_map["ElektriciteitNetgebruikHoogDiff"] == "my_custom_col"
         assert "my_custom_col" in out_df.columns
         assert "my_custom_col" in overrides
+
+
+# ---------------------------------------------------------------------------
+# ADR-003: variable-type override schema and profile-renderability gate
+# ---------------------------------------------------------------------------
+
+class TestVariableType:
+    """variable_type resolves classification from overrides first, then etdmap."""
+
+    def test_override_type_wins(self):
+        ov = {"my_col": {"unit": "kW", "type": "interval_mean"}}
+        assert variable_type("my_col", overrides=ov) == "interval_mean"
+
+    def test_etdmap_momentaan_lookup(self):
+        # TemperatuurBuitenWarmtepomp is Momentaan=ja in etdmap.
+        assert variable_type("TemperatuurBuitenWarmtepomp") == "momentaan"
+
+    def test_etdmap_diff_lookup(self):
+        assert variable_type("ElektriciteitNetgebruikHoogDiff") == "diff"
+
+    def test_unknown_column_returns_none(self):
+        assert variable_type("totally_made_up_col") is None
+
+    def test_plain_string_override_does_not_classify(self):
+        # Plain-string override carries only unit; classification falls
+        # through to etdmap, which returns None for unknown columns.
+        assert variable_type("my_col", overrides={"my_col": "kW"}) is None
+
+
+class TestIsRenderableOnProfile:
+    """Profile-renderability gate accepts momentaan and interval_mean only."""
+
+    @pytest.mark.parametrize("vtype", ["momentaan", "interval_mean"])
+    def test_admits_renderable_types(self, vtype):
+        ov = {"c": {"unit": "kW", "type": vtype}}
+        assert is_renderable_on_profile("c", overrides=ov) is True
+
+    @pytest.mark.parametrize("vtype", ["diff", "cumulatief"])
+    def test_refuses_non_renderable_types(self, vtype):
+        ov = {"c": {"unit": "kWh", "type": vtype}}
+        assert is_renderable_on_profile("c", overrides=ov) is False
+
+    def test_unclassified_column_refused(self):
+        # No override, not in etdmap -> classification is None -> gate refuses.
+        assert is_renderable_on_profile("totally_made_up_col") is False
+
+
+class TestNestedOverrideValidation:
+    """Boundary validation: legacy boolean keys raise, type enum is strict."""
+
+    def test_legacy_momentaan_key_rejected_with_hint(self):
+        ov = {"c": {"unit": "kW", "momentaan": True}}
+        with pytest.raises(ValueError, match="legacy key.*momentaan"):
+            resolve_unit("c", overrides=ov)
+
+    def test_legacy_cumulatief_key_rejected(self):
+        ov = {"c": {"unit": "kWh", "cumulatief": True}}
+        with pytest.raises(ValueError, match="legacy key.*cumulatief"):
+            resolve_unit("c", overrides=ov)
+
+    def test_legacy_diff_key_rejected(self):
+        ov = {"c": {"unit": "kWh", "diff": True}}
+        with pytest.raises(ValueError, match="legacy key.*diff"):
+            resolve_unit("c", overrides=ov)
+
+    def test_legacy_aggregatie_methode_key_rejected(self):
+        # Old dead-doc key. Reject loud so callers move to the kwarg.
+        ov = {"c": {"unit": "kW", "aggregatie_methode": "mean"}}
+        with pytest.raises(ValueError, match="legacy key.*aggregatie_methode"):
+            resolve_unit("c", overrides=ov)
+
+    def test_unknown_nested_key_rejected(self):
+        ov = {"c": {"unit": "kW", "bogus_field": 42}}
+        with pytest.raises(ValueError, match="unknown key"):
+            resolve_unit("c", overrides=ov)
+
+    def test_invalid_type_enum_value_rejected(self):
+        ov = {"c": {"unit": "kW", "type": "not_a_real_type"}}
+        with pytest.raises(ValueError, match="allowed values"):
+            resolve_unit("c", overrides=ov)
+
+    def test_plain_string_override_still_accepted(self):
+        # Backward compat for short-form overrides: unchanged behaviour.
+        assert resolve_unit("c", overrides={"c": "kW"}) == "kW"
+
+    def test_unit_only_nested_override(self):
+        # Nested override with only "unit" is fine; no type validation triggered.
+        assert resolve_unit("c", overrides={"c": {"unit": "kW"}}) == "kW"
+
+    def test_type_only_nested_override(self):
+        # Nested override with only "type" is fine; resolve_unit falls
+        # through to etdmap for the unit lookup.
+        ov = {"TemperatuurBuitenWarmtepomp": {"type": "momentaan"}}
+        # etdmap unit for TemperatuurBuitenWarmtepomp is "graden C".
+        assert resolve_unit("TemperatuurBuitenWarmtepomp", overrides=ov) == "graden C"

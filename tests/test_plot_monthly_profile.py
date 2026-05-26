@@ -80,12 +80,13 @@ def test_rejects_cumulative_meter():
 def test_accepts_overridden_power_unit():
     """A caller-derived kW column synthesised outside the data model
     passes the gate when overrides declare both the unit (for labelling)
-    and momentaan=True (for the longitudinal gate, per ADR-003)."""
+    and type=interval_mean (for the profile-renderability gate, per
+    ADR-003)."""
     import matplotlib.pyplot as plt
     df = _synthetic_hourly().rename(columns={_TEST_COL: "my_derived_kW"})
     fig = plot_monthly_profile(
         df, "my_derived_kW",
-        overrides={"my_derived_kW": {"unit": "kW", "momentaan": True}},
+        overrides={"my_derived_kW": {"unit": "kW", "type": "interval_mean"}},
     )
     assert isinstance(fig, plt.Figure)
     plt.close(fig)

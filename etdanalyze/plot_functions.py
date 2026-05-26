@@ -37,12 +37,21 @@ def resolve_unit(col: str, overrides: Optional[dict] = None) -> str:
     """
     Return the unit string for a column, with optional per-call overrides.
 
+    Thin delegate to :func:`etdanalyze.units.resolve_unit`, which is the
+    single source of truth for unit resolution. Kept exported here so
+    existing call sites (``from etdanalyze.plot_functions import
+    resolve_unit``) continue to work.
+
     Resolution order, strict-by-default:
 
-      1. ``overrides[col]`` -- caller-supplied. ``""`` is a valid value
-         that explicitly marks the column unitless. Use this for
-         derived / analysis-time variables that are not in the etdmap
-         data model (e.g. ``COP_system`` -> ``""``,
+      1. ``overrides[col]`` -- caller-supplied. Two shapes are accepted:
+         plain ``{col: "kW"}`` and nested
+         ``{col: {"unit": "kW", "momentaan": True}}`` (the form produced
+         by :func:`etdanalyze.units.convert_interval_diff`). The nested
+         form is unwrapped: only the unit string is returned. ``""`` is
+         a valid value that explicitly marks the column unitless. Use
+         this for derived / analysis-time variables that are not in the
+         etdmap data model (e.g. ``COP_system`` -> ``""``,
          ``ZonopwekBrutoPer100M2KW`` -> ``"kW per 100m2"``) and for
          display-unit variants produced upstream (e.g. a Diff column
          after ``convert_diff_to_power`` is now kW, not kWh).
@@ -60,15 +69,8 @@ def resolve_unit(col: str, overrides: Optional[dict] = None) -> str:
     KeyError
         Column is in neither ``overrides`` nor the data model.
     """
-    if overrides is not None and col in overrides:
-        return overrides[col]
-    unit = unit_for_column(col)
-    if unit:
-        return unit
-    raise KeyError(
-        f"resolve_unit: no unit known for column {col!r}. "
-        f"Pass overrides={{{col!r}: '<unit>'}} (use '' for unitless)."
-    )
+    from etdanalyze.units import resolve_unit as _units_resolve_unit
+    return _units_resolve_unit(col, overrides=overrides)
 
 
 def axis_label_with_unit(
@@ -2022,7 +2024,7 @@ def plot_boxwhisker_comparison(
         return fig
 
 
-def plot_household_range_strips(
+def plot_range_strips_candlestick(
     df: pd.DataFrame,
     *,
     project_col: str = "ProjectIdBSV",
@@ -2034,13 +2036,15 @@ def plot_household_range_strips(
     y_label: Optional[str] = None,
     save_fig_path: Optional[str] = None,
     xtick_prefix: str = "Proj ",
+    grouping_col: Optional[str] = None,
 ) -> Optional[plt.Figure]:
     """
-    Dense per-household range strips, grouped by project.
+    Dense per-row range strips drawn in candlestick style, grouped on the x-axis.
 
-    Each row describes one household's stats for a single variable;
-    each household becomes one vertical 1-pixel-wide strip on the
-    x-axis. Within each strip three nested intervals overlay:
+    Each row describes one unit's stats for a single variable
+    (typically per-household when ``id_col="HuisIdBSV"``); each unit
+    becomes one vertical 1-pixel-wide strip on the x-axis. Within
+    each strip three nested intervals overlay:
 
       - lightest layer: ``min`` to ``max`` (full observed range)
       - mid layer:      ``p01`` to ``p99``
@@ -2049,33 +2053,41 @@ def plot_household_range_strips(
       - bright dot at:  ``median``
 
     The intervals are nested so when overlaid the outer band is
-    visible only outside the inner one. Households are coloured by
+    visible only outside the inner one. Strips are coloured by
     ``color_group``; the three layers reuse the same hue at
     increasing opacity (0.25 / 0.55 / 0.95) so a denser plot
     remains legible without changing line thickness.
 
     Implementation note: rendering is vectorised via
     ``matplotlib.collections.LineCollection`` -- one collection
-    per band regardless of household count -- so 100s of households
-    render in well under a second. Households are ordered
+    per band regardless of strip count -- so 100s of strips
+    render in well under a second. Strips are ordered
     project-first; project tick labels sit at the centre of each
     project group.
 
     Missing percentile columns are tolerated; the corresponding
     band is skipped silently.
+
+    Parameters
+    ----------
+    grouping_col : str, optional
+        Column describing what each row represents (e.g.
+        ``"HuisIdBSV"`` -> "per huishouden", ``"ProjectIdBSV"`` ->
+        "per project"). Drives the default y-axis / title wording
+        via :mod:`etdanalyze.grouping`. Defaults to ``id_col``.
     """
     from matplotlib.collections import LineCollection
 
     required = {id_col, project_col, "min", "max", "median"}
     missing = required - set(df.columns)
     if missing:
-        raise KeyError(f"plot_household_range_strips: missing columns {missing}")
+        raise KeyError(f"plot_range_strips_candlestick: missing columns {missing}")
 
     plot_df = df.dropna(subset=["min", "max", "median"]).copy()
     # Strict empty-data guard -- no silent empty plots.
     if plot_df.empty:
         raise ValueError(
-            "plot_household_range_strips: no rows with non-NA "
+            "plot_range_strips_candlestick: no rows with non-NA "
             "min/max/median. Check coverage upstream and skip the call."
         )
 
@@ -2189,7 +2201,14 @@ def plot_household_range_strips(
     ax.autoscale_view(scalex=False, scaley=True)
     ax.grid(True, axis="y", alpha=0.3)
 
-    base_y = y_label or "value per household"
+    # Default y-axis / title wording is driven by the grouping
+    # registry so the labels stay correct when the helper is used
+    # with non-HH inputs (e.g. one row per project).
+    from etdanalyze.grouping import label_for_grouping
+    grouping_meta = label_for_grouping(grouping_col or id_col)
+    per_phrase = grouping_meta["per_phrase"]
+
+    base_y = y_label or f"waarde {per_phrase}"
     if column_name:
         # Strict: raises if column_name is in neither the data model nor
         # `overrides`. No silent fallback, no "(" guard -- callers must
@@ -2198,8 +2217,8 @@ def plot_household_range_strips(
     ax.set_ylabel(base_y)
 
     base_title = title or (
-        f"{column_name} per household"
-        if column_name else "Per-household range strips"
+        f"{column_name} {per_phrase}"
+        if column_name else f"Range strips ({per_phrase})"
     )
     if column_name:
         base_title = axis_label_with_unit(column_name, base_title, overrides=overrides)
@@ -2224,7 +2243,7 @@ def plot_household_range_strips(
     return fig
 
 
-def plot_household_range_heatmap(
+def plot_range_strips_blocks(
     df: pd.DataFrame,
     *,
     project_col: str = "ProjectIdBSV",
@@ -2240,24 +2259,25 @@ def plot_household_range_heatmap(
     show_household_ids: bool = False,
     households_to_label: Optional[object] = None,
     household_id_fontsize: int = 7,
+    grouping_col: Optional[str] = None,
 ) -> Optional[plt.Figure]:
     """
-    Discrete-band per-household range strips: side-by-side columns,
-    no gaps, percentile bands rendered as solid blocks of colour.
+    Discrete-band per-row range strips: side-by-side columns, no gaps,
+    percentile bands rendered as solid blocks of colour.
 
-    Each household becomes one column on the x-axis. The y-axis is
-    sliced into bins; each cell sits in exactly one of three
-    discrete bands, with a flat colour from a friendly palette:
+    Each row of the input frame becomes one column on the x-axis
+    (typically per-household when ``id_col="HuisIdBSV"``). The
+    y-axis is sliced into bins; each cell sits in exactly one of
+    three discrete bands, with a flat colour from a friendly palette:
 
       - **last percentile** (``#cda4a4``): the outermost 1% on
         each side -- ``min..p25`` and ``p99..max``. Muted dusty
-        rose so a wide last-percentile band signals the household
+        rose so a wide last-percentile band signals the row
         has extreme outliers without visually drowning the rest.
       - **tail** (``#f4a261``): ``p25..q25`` and ``q75..p99``.
         Warm peach -- meaningful but not loud.
       - **IQR** (``#2a6f97``): ``q25..q75``. Solid deep teal-blue
-        for the interquartile range where the household spends
-        most of its time.
+        for the interquartile range.
 
     The median sits as a high-contrast tick (white core with a
     black outline via path_effects) so it stays visible against
@@ -2294,6 +2314,11 @@ def plot_household_range_heatmap(
         Point size for the household-id labels when
         ``show_household_ids=True``. Default 7 -- horizontal labels
         at this size are legible without zooming in DOCX exports.
+    grouping_col : str, optional
+        Column describing what each row represents (e.g.
+        ``"HuisIdBSV"`` -> "per huishouden", ``"ProjectIdBSV"`` ->
+        "per project"). Drives the default y-axis / title wording
+        via :mod:`etdanalyze.grouping`. Defaults to ``id_col``.
 
     Required columns: ``id_col``, ``project_col``, ``min``, ``max``,
     ``median``, ``p01``, ``p25``, ``p75``,
@@ -2310,17 +2335,17 @@ def plot_household_range_heatmap(
     missing = required - set(df.columns)
     if missing:
         raise KeyError(
-            f"plot_household_range_heatmap: missing columns {missing}"
+            f"plot_range_strips_blocks: missing columns {missing}"
         )
 
     plot_df = df.dropna(subset=[
         "min", "max", "median",
         "p01", "p25", "p75", "p99",
     ]).copy()
-    # Strict empty-data guard -- no silent empty heatmaps.
+    # Strict empty-data guard -- no silent empty plots.
     if plot_df.empty:
         raise ValueError(
-            "plot_household_range_heatmap: no rows with non-NA "
+            "plot_range_strips_blocks: no rows with non-NA "
             "min/max/median/p01/p25/p75/p99. Check coverage upstream "
             "and skip the call."
         )
@@ -2477,7 +2502,14 @@ def plot_household_range_heatmap(
         # but the axis itself extends a bit further.
         ax.set_ylim(y_lo - y_range_data * 0.05, y_hi + y_range_data * 0.20)
 
-    base_y = y_label or "value per household"
+    # Default y-axis / title wording driven by the grouping registry
+    # so labels stay correct for non-HH inputs (e.g. one row per
+    # project).
+    from etdanalyze.grouping import label_for_grouping
+    grouping_meta = label_for_grouping(grouping_col or id_col)
+    per_phrase = grouping_meta["per_phrase"]
+
+    base_y = y_label or f"waarde {per_phrase}"
     if column_name:
         # Strict: raises if column_name is in neither the data model nor
         # `overrides`. No "(" guard -- callers must not pre-stamp.
@@ -2485,8 +2517,8 @@ def plot_household_range_heatmap(
     ax.set_ylabel(base_y, fontsize=9)
 
     base_title = title or (
-        f"{column_name} per household"
-        if column_name else "Per-household range bands"
+        f"{column_name} {per_phrase}"
+        if column_name else f"Range strips ({per_phrase})"
     )
     if column_name:
         base_title = axis_label_with_unit(column_name, base_title, overrides=overrides)

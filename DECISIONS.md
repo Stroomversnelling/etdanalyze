@@ -246,3 +246,172 @@ callers that wrap plot calls in `try/except` (e.g.
 strict-pattern caller idiom is the preferred shape for new code.
 
 ---
+
+## ADR-003: Profile-plot gate uses a single variable-type override slot; converted Diff is `interval_mean`, not `momentaan`
+
+The data model in etdmap classifies every variable along three
+mutually exclusive ja/nee classifier columns in `etdmodel.csv`
+(see `etdmap.data_model._build_derived_structures`):
+
+- `Cumulatief=ja` -- ever-increasing meter reading (e.g. kWh totaal).
+  Plotting the raw value on a time profile shows only a ramp, not
+  any phenomenon. Not renderable.
+- `Momentaan=ja` -- instantaneous reading sampled AT the row's
+  timestamp (e.g. temperature, instantaneous power meter).
+  Renderable.
+- `Diff=ja` -- dataset-cadence delta of a Cumulatief variable
+  (e.g. `ElektriciteitsgebruikTotaalNettoDiff` is the kWh
+  delta over the row's interval). The raw value depends on
+  recording cadence (0.5 kWh in 5 min is a different physical
+  thing than 0.5 kWh in 60 min). Not renderable directly.
+
+Profile / timeline plots (`plot_daily_profile_bands`,
+`plot_weekly_profile`, `plot_monthly_profile`, ...) place values on
+a time axis. The y-value at a given x-value must be interpretable
+without the reader thinking about the row cadence. Two distinct
+kinds of variable satisfy that:
+
+1. Native `Momentaan` -- the sample at that timestamp.
+2. An **interval-mean rate** derived from a Diff column (kWh-per-row
+   / hours-per-row = kW; m3-per-row / hours-per-row = m3 / uur). The
+   rate value is interval-cadence-independent in the numbers. The
+   values are NOT instantaneous: they are arithmetic means over the
+   interval.
+
+These two categories are NOT the same. A converted Diff is not a
+`Momentaan` variable -- it is an interval mean of an instantaneous
+quantity. Conflating them in code corrupts the data-model
+classification.
+
+### Rules
+
+1. **One classification slot per column override.** Per-call
+   overrides for column metadata use a single nested dict with a
+   strict schema:
+
+   ```python
+   overrides = {
+       "MyColumn": {
+           "unit": "kW",                       # str; display unit
+           "type": "interval_mean",            # str enum, see below
+       }
+   }
+   ```
+
+   The plain short form `{col: "kW"}` is also accepted for
+   unit-only declarations. Both keys (`unit`, `type`) are
+   independently optional in the nested form -- a missing key
+   falls through to etdmap.
+
+2. **The `type` enum values are fixed.** Allowed values:
+
+   - `"cumulatief"` -- maps to etdmap `Cumulatief=ja`.
+   - `"momentaan"` -- maps to etdmap `Momentaan=ja`.
+   - `"diff"` -- maps to etdmap `Diff=ja`.
+   - `"interval_mean"` -- analysis-derived rate (kW from kWh-Diff,
+     m3 / uur from m3-Diff, etc.). NOT in etdmap; only declarable
+     via override.
+
+   The first three string values are the Dutch terms because they
+   are how etdmap names the classifications in `etdmodel.csv` (the
+   source of truth). `interval_mean` is an etdanalyze concept and
+   stays in English.
+
+3. **Booleans like `momentaan: True`, `cumulatief: True`,
+   `diff: True` are forbidden in the override dict.** They suggest
+   independent orthogonal flags, but the underlying classification
+   is one of four mutually exclusive types. Any override that uses
+   the old booleans raises `ValueError` at the boundary with a
+   message pointing to the new `type` slot. There is no silent
+   ignore.
+
+4. **Override-keyed metadata reads through one resolver.**
+   `etdanalyze.units.variable_type(col, overrides=None)` returns
+   one of the four type values or `None`. Lookup order: override
+   `type` -> etdmap membership lists (`momentaan_columns`,
+   `cumulative_columns`, `diff_columns`) -> `None`. Predicates that
+   wrap it (`is_renderable_on_profile`) compare its result to the
+   relevant enum values. Individual `is_momentaan` /
+   `is_cumulatief` / `is_diff_variable` predicates are not on the
+   public surface -- callers compare `variable_type(col, ov) ==
+   "momentaan"` (etc.) directly when they need a single class.
+
+5. **The profile-plot gate predicate is
+   `is_renderable_on_profile`, not `is_momentaan`.**
+   `is_renderable_on_profile(col, overrides)` returns True iff
+   `variable_type(col, overrides) in ("momentaan",
+   "interval_mean")`. `assert_renderable_on_timeline` (the
+   boundary helper called by every profile plot helper) uses this
+   predicate.
+
+6. **The single source of truth for unit-string resolution is
+   `etdanalyze.units.resolve_unit`.** It handles plain
+   (`{col: "kW"}`) and nested (`{col: {"unit": "kW",
+   "type": "..."}}`) override shapes.
+   `etdanalyze.plot_functions.resolve_unit` is a thin delegate; it
+   must NOT contain its own resolution logic. Divergence between
+   the two is what produced the `({'unit': 'kW', 'momentaan':
+   True})` label-rendering bug visible in early 2026 profile
+   plots.
+
+7. **`convert_interval_diff` produces overrides with the new
+   shape.** For each converted column it emits
+   `{"unit": <display_unit>, "type": "interval_mean"}`. The
+   `interval_mean` value is appropriate because both registered
+   converters (kWh-Diff -> kW, volume-Diff -> volume / uur)
+   produce interval-mean rates.
+
+8. **Override origin is not restricted.** Any caller -- a
+   built-in conversion helper, a custom analysis script in
+   `etdanalyze-internal`, an external user's notebook -- may
+   construct an override dict directly. The contract is the
+   schema (rules 1-3), not the producer.
+
+### Implementation references
+
+- `etdanalyze.units.variable_type(col, overrides)` -- the resolver.
+- `etdanalyze.units.is_renderable_on_profile(col, overrides)` --
+  the profile-plot gate predicate.
+- `etdanalyze.units.assert_renderable_on_timeline(col, *,
+  overrides, plot_type, axis)` -- the boundary helper, called by
+  every profile-plot helper before reading the column.
+- `etdanalyze.units.resolve_unit(col, overrides)` -- single
+  source of truth for unit resolution; handles both override
+  shapes.
+- `etdanalyze.units._override_field(overrides, col, field)` --
+  low-level reader; validates the nested-dict schema and raises
+  on unknown keys or bad `type` values.
+- `etdanalyze.units.convert_interval_diff(df, *cols, interval=,
+  overrides=, new_names=)` -- canonical Diff -> interval-mean
+  rate dispatcher.
+
+### Why
+
+- **One enum slot mirrors the data model.** etdmap has one
+  classification per variable; the override schema should too.
+  Multiple boolean keys allowed mutually exclusive options to be
+  set simultaneously, which is meaningless.
+- **`Momentaan` and `interval_mean` are physically different
+  things.** A converted Diff is a mean of values over an
+  interval, not a sample at a timestamp. Code that calls a
+  converted variable "momentaan" lies about what the data is and
+  invites the next bug (e.g. a future helper that needs
+  instantaneous-only inputs and incorrectly accepts an interval
+  mean).
+- **Strict boundary validation prevents silent drift.** Override
+  callers wrote `{"momentaan": True}` because the dispatcher
+  documented it as supported. Removing the silent-acceptance
+  contract is how the data-model violation gets surfaced loudly
+  rather than buried in label text.
+
+### Scope
+
+Applies to every code path in `etdanalyze` that consumes a
+per-call overrides dict, every plot helper that gates on
+profile-renderability, and every caller in
+`etdanalyze-internal/analysis` or external scripts that
+constructs overrides by hand. The schema change is breaking by
+design: callers passing the old `{"momentaan": True}` shape see
+a `ValueError` with a hint pointing at this ADR.
+
+---

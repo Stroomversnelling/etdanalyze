@@ -13,7 +13,8 @@ from etdanalyze.plot_functions import (
     axis_label_with_unit,
     detect_value_range_clusters,
     plot_boxwhisker_comparison,
-    plot_household_range_strips,
+    plot_range_strips_blocks,
+    plot_range_strips_candlestick,
     unit_for_column,
 )
 from etdanalyze.analysis_helpers import (
@@ -48,7 +49,7 @@ class TestUnitLookup:
 
     def test_axis_label_raises_on_unknown(self):
         # Loud failure: callers must pass an override for non-data-model columns.
-        with pytest.raises(KeyError, match="no unit known"):
+        with pytest.raises(KeyError, match="[Nn]o unit known"):
             axis_label_with_unit("__not_a_real_column__", "median")
 
     def test_axis_label_defaults_base_to_column(self):
@@ -363,6 +364,136 @@ class TestBoxwhiskerExtensions:
                 color_group="WoningType",
             )
 
+    def test_scatter_all_renders(self, tmp_path):
+        """Explicit scatter='all' draws the whole-population swarm."""
+        df = self._frame()
+        out = tmp_path / "scatter_all.png"
+        plot_boxwhisker_comparison(
+            df, value_col="median", x_group="ProjectIdBSV", color_group="WoningType",
+            scatter="all", save_fig_path=str(out),
+        )
+        assert out.exists() and out.stat().st_size > 0
+
+    def test_scatter_none_renders(self, tmp_path):
+        """scatter='none' draws boxes only, no overlay markers."""
+        df = self._frame()
+        out = tmp_path / "scatter_none.png"
+        plot_boxwhisker_comparison(
+            df, value_col="median", x_group="ProjectIdBSV", color_group="WoningType",
+            scatter="none", save_fig_path=str(out),
+        )
+        assert out.exists() and out.stat().st_size > 0
+
+    def test_scatter_matplotlib_renders(self, tmp_path):
+        """scatter='matplotlib' uses native fliers; tinting is applied
+        per box when x_group == color_group."""
+        df = self._frame()
+        out = tmp_path / "scatter_matplotlib.png"
+        # Force outliers so there's at least one flier per box: append
+        # extreme points to P1 and P3.
+        extra = pd.DataFrame([
+            {"HuisIdBSV": "P1_X", "ProjectIdBSV": "P1", "WoningType": "TypeA", "median": 9999.0},
+            {"HuisIdBSV": "P3_X", "ProjectIdBSV": "P3", "WoningType": "TypeA", "median": -9999.0},
+        ])
+        df2 = pd.concat([df, extra], ignore_index=True)
+        plot_boxwhisker_comparison(
+            df2, value_col="median",
+            x_group="ProjectIdBSV", color_group="ProjectIdBSV",
+            scatter="matplotlib", save_fig_path=str(out),
+        )
+        assert out.exists() and out.stat().st_size > 0
+
+    def test_scatter_auto_picks_all_at_low_n(self, tmp_path):
+        """At default N (~25 rows per box) auto resolves to 'all'."""
+        df = self._frame()
+        out = tmp_path / "scatter_auto_low.png"
+        plot_boxwhisker_comparison(
+            df, value_col="median", x_group="ProjectIdBSV", color_group="WoningType",
+            scatter="auto", save_fig_path=str(out),
+        )
+        assert out.exists() and out.stat().st_size > 0
+
+    def test_scatter_auto_picks_matplotlib_at_high_n(self, tmp_path):
+        """At high N per box (> 200 rows) auto resolves to 'matplotlib'."""
+        df = self._frame(n_per_project=500)
+        out = tmp_path / "scatter_auto_high.png"
+        plot_boxwhisker_comparison(
+            df, value_col="median",
+            x_group="ProjectIdBSV", color_group="ProjectIdBSV",
+            scatter="auto", save_fig_path=str(out),
+        )
+        assert out.exists() and out.stat().st_size > 0
+
+    def test_scatter_invalid_raises(self):
+        """An unknown scatter mode is a programmer error -- raise."""
+        df = self._frame()
+        with pytest.raises(ValueError, match="unknown scatter mode"):
+            plot_boxwhisker_comparison(
+                df, value_col="median", x_group="ProjectIdBSV", color_group="WoningType",
+                scatter="nonsense",
+            )
+
+    def test_grouping_col_drives_per_phrase_in_title(self, tmp_path):
+        """grouping_col='WeerstationGroep' renders 'per weerstation' in
+        the default title (replacing the historic 'per huishouden')."""
+        from etdanalyze.plot_functions import (
+            DEFAULT_BOXWHISKER_TITLE_TPL, DEFAULT_BOXWHISKER_YLABEL_TPL,
+        )
+        # Both templates carry the placeholder so the registry value
+        # surfaces in both the title and the y-axis.
+        assert "{per_grouping}" in DEFAULT_BOXWHISKER_TITLE_TPL
+        assert "{per_grouping}" in DEFAULT_BOXWHISKER_YLABEL_TPL
+
+        df = self._frame()
+        out = tmp_path / "grouping.png"
+        import matplotlib.pyplot as plt
+        fig = plot_boxwhisker_comparison(
+            df, value_col="median",
+            x_group="ProjectIdBSV", color_group="WoningType",
+            grouping_col="WeerstationGroep",
+        )
+        try:
+            assert fig is not None
+            ax = fig.axes[0]
+            assert "per weerstation" in ax.get_title()
+            assert "per weerstation" in ax.get_ylabel()
+            fig.savefig(out, dpi=150)
+        finally:
+            plt.close(fig)
+        assert out.exists()
+
+    def test_grouping_col_defaults_to_id_col(self, tmp_path):
+        """No grouping_col -> falls back to id_col (HuisIdBSV) ->
+        'per huishouden' in the title."""
+        df = self._frame()
+        import matplotlib.pyplot as plt
+        fig = plot_boxwhisker_comparison(
+            df, value_col="median",
+            x_group="ProjectIdBSV", color_group="WoningType",
+        )
+        try:
+            assert fig is not None
+            ax = fig.axes[0]
+            assert "per huishouden" in ax.get_title()
+        finally:
+            plt.close(fig)
+
+    def test_grouping_col_unknown_falls_back_to_per_col(self, tmp_path):
+        """Unknown grouping column -> generic 'per <col>' phrase."""
+        df = self._frame()
+        import matplotlib.pyplot as plt
+        fig = plot_boxwhisker_comparison(
+            df, value_col="median",
+            x_group="ProjectIdBSV", color_group="WoningType",
+            grouping_col="WildlyMadeUpColumn",
+        )
+        try:
+            assert fig is not None
+            ax = fig.axes[0]
+            assert "per WildlyMadeUpColumn" in ax.get_title()
+        finally:
+            plt.close(fig)
+
     def test_secondary_axis_renders_as_stacked_subplot(self, tmp_path):
         """When secondary_axis_data is provided, the figure must have two
         subplots (boxplot on top, companion scatter beneath, sharing
@@ -393,7 +524,7 @@ class TestBoxwhiskerExtensions:
 
 
 # ---------------------------------------------------------------------------
-# plot_household_range_strips  (per-household candlestick)
+# plot_range_strips_candlestick  (per-household candlestick)
 # ---------------------------------------------------------------------------
 
 
@@ -425,7 +556,7 @@ class TestPlotHouseholdRangeStrips:
     def test_writes_non_empty_png(self, tmp_path):
         df = self._frame()
         out = tmp_path / "strips.png"
-        plot_household_range_strips(
+        plot_range_strips_candlestick(
             df, column_name="ElektriciteitNetgebruikHoog",
             save_fig_path=str(out),
         )
@@ -434,7 +565,7 @@ class TestPlotHouseholdRangeStrips:
     def test_returns_figure_when_no_path(self):
         import matplotlib.pyplot as plt
         df = self._frame()
-        fig = plot_household_range_strips(df)
+        fig = plot_range_strips_candlestick(df)
         try:
             assert fig is not None
             # Single-axis layout (no stacked subplot).
@@ -445,7 +576,7 @@ class TestPlotHouseholdRangeStrips:
     def test_unit_appears_in_labels_when_column_known(self):
         import matplotlib.pyplot as plt
         df = self._frame()
-        fig = plot_household_range_strips(df, column_name="ElektriciteitNetgebruikHoog")
+        fig = plot_range_strips_candlestick(df, column_name="ElektriciteitNetgebruikHoog")
         try:
             ylabel = fig.axes[0].get_ylabel()
             assert "(kWh)" in ylabel
@@ -455,7 +586,7 @@ class TestPlotHouseholdRangeStrips:
     def test_missing_required_column_raises(self):
         df = pd.DataFrame({"HuisIdBSV": [1], "ProjectIdBSV": [1], "min": [0.0]})
         with pytest.raises(KeyError, match="missing columns"):
-            plot_household_range_strips(df)
+            plot_range_strips_candlestick(df)
 
     def test_missing_optional_percentile_columns_silently_drops_segments(self, tmp_path):
         # min/median/max only -- no p25/q25/q75/p99. Should still render.
@@ -468,5 +599,5 @@ class TestPlotHouseholdRangeStrips:
             "max":             [4.0, 5.0, 9.0],
         })
         out = tmp_path / "strips_minimal.png"
-        plot_household_range_strips(df, save_fig_path=str(out))
+        plot_range_strips_candlestick(df, save_fig_path=str(out))
         assert out.exists() and out.stat().st_size > 0
