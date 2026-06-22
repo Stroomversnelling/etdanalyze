@@ -343,6 +343,51 @@ class TestBoxwhiskerExtensions:
         )
         assert out.exists() and out.stat().st_size > 0
 
+    def test_x_order_overrides_default_alphabetical(self):
+        """x_order is opt-in. Omitted -> the default alphabetical (string)
+        order, so numeric ProjectIdBSV reads 1, 10, 2. Supplied -> the
+        caller's exact left-to-right order, e.g. 1, 2, 10. The default must be
+        unchanged (it is an intended feature, not a bug)."""
+        import matplotlib.pyplot as plt
+        rows = [
+            {"HuisIdBSV": f"{p}_{i}", "ProjectIdBSV": p, "WoningType": "A",
+             "median": float(p + i)}
+            for p in (1, 2, 10) for i in range(6)
+        ]
+        df = pd.DataFrame(rows)
+        # default unchanged: alphabetical by str -> "1", "10", "2"
+        fig = plot_boxwhisker_comparison(
+            df, value_col="median", x_group="ProjectIdBSV",
+            color_group="ProjectIdBSV",
+        )
+        assert [t.get_text() for t in fig.axes[0].get_xticklabels()] == ["1", "10", "2"]
+        plt.close(fig)
+        # explicit numeric order honoured
+        fig = plot_boxwhisker_comparison(
+            df, value_col="median", x_group="ProjectIdBSV",
+            color_group="ProjectIdBSV", x_order=[1, 2, 10],
+        )
+        assert [t.get_text() for t in fig.axes[0].get_xticklabels()] == ["1", "2", "10"]
+        plt.close(fig)
+
+    def test_x_order_keeps_unlisted_categories(self):
+        """Categories present in the data but absent from x_order are appended
+        (alphabetically) so none are silently dropped."""
+        import matplotlib.pyplot as plt
+        rows = [
+            {"HuisIdBSV": f"{p}_{i}", "ProjectIdBSV": p, "WoningType": "A",
+             "median": float(p + i)}
+            for p in (1, 2, 3) for i in range(6)
+        ]
+        df = pd.DataFrame(rows)
+        fig = plot_boxwhisker_comparison(
+            df, value_col="median", x_group="ProjectIdBSV",
+            color_group="ProjectIdBSV", x_order=[3],  # only 3 listed
+        )
+        # 3 first (listed), then 1, 2 appended alphabetically
+        assert [t.get_text() for t in fig.axes[0].get_xticklabels()] == ["3", "1", "2"]
+        plt.close(fig)
+
     def test_raises_on_all_na_value_col(self):
         """Strict empty-data contract: when every row's value_col is NA
         the helper raises ValueError pointing the caller at upstream
@@ -542,7 +587,7 @@ class TestPlotHouseholdRangeStrips:
                 rows.append({
                     "HuisIdBSV": f"P{proj}_{i}",
                     "ProjectIdBSV": proj,
-                    "Dataleverancier": "Watch-E" if proj > 1 else "Factory Zero",
+                    "Dataleverancier": "SupplierB" if proj > 1 else "SupplierA",
                     "min": float(base + rng.normal(0, 0.1)),
                     "p01": float(base + 0.5),
                     "p25": float(base + 1.0),

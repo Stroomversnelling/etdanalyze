@@ -44,9 +44,6 @@ _INTERVAL_HOURS = {
     "24h":   24.0,
 }
 
-_HOURS_PER_DAY = 24
-_DAYS_PER_YEAR = 365
-
 # Loaded once at module import. Mirror of the dict used by
 # etdanalyze.plot_functions.unit_for_column; loaded here too so this
 # module has no import-time dependency on plot_functions (which itself
@@ -928,54 +925,6 @@ def convert_diff_to_power(
             f"per-row energy and the multiplier would produce nonsense."
         )
     return series * switch_multiplier(interval), "kW"
-
-
-def mean_per_row_to_period_total(
-    mean_value: float,
-    col_name: str,
-    interval: str,
-    *,
-    period_days: int = _DAYS_PER_YEAR,
-    overrides: Optional[dict] = None,
-) -> tuple[float, str]:
-    """
-    Scale a mean-per-row value to a period total in the variable's own unit.
-
-    Use when the underlying variable is cumulative (sum-resampled in
-    etdmodel.csv) and the report wants a per-household per-period figure
-    (e.g. kWh per year, m3 per year) instead of the raw per-row mean.
-    The per-row-to-per-period scaling preserves the unit -- only the
-    time scope changes -- so the display unit equals the input unit.
-
-    Parameters
-    ----------
-    mean_value : float
-        Mean of the per-row values.
-    col_name : str
-        Column name in the data model (or in ``overrides``) used to
-        record / verify the input unit.
-    interval : str
-        Row interval label ("5min", "15min", ...).
-    period_days : int, default 365
-        Number of days in the target period (365 for "per year",
-        ~213 for "verwarmingsperiode" Oct-Apr, etc.).
-    overrides : dict, optional
-        Per-call ``{col: unit}`` for columns outside the data model.
-
-    Returns
-    -------
-    (float, str)
-        Period total in the variable's natural unit, and the unit string
-        (e.g. ``("4500.0", "kWh")``).
-
-    Raises
-    ------
-    KeyError
-        If ``col_name`` has no unit in the data model and no override.
-    """
-    input_unit = _resolve_input_unit(col_name, overrides)
-    rows_per_period = period_days * _HOURS_PER_DAY / interval_hours(interval)
-    return mean_value * rows_per_period, input_unit
 
 
 # Supported internal unit conversions inside to_per_m2.

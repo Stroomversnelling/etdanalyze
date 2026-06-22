@@ -53,8 +53,8 @@ The single source of truth for units is the etdmap data model
 
 4. **Conversion helpers verify expected input units before doing
    anything else.** Every function that transforms values from one unit
-   to another (`convert_diff_to_power`, `to_per_m2`,
-   `mean_per_row_to_period_total`, future additions) takes the source
+   to another (`convert_diff_to_power`, `to_per_m2`, future additions)
+   takes the source
    column name (or accepts a per-call override) and asserts the
    column's unit matches what the conversion expects. A mismatch raises
    `ValueError` at the entry of the helper, before any multiplication.
@@ -83,9 +83,8 @@ The single source of truth for units is the etdmap data model
 - `etdanalyze.units._resolve_input_unit(col_name, overrides)` -- the
   canonical input-unit resolver. Lookup order: overrides -> data model
   -> raise `KeyError`.
-- `etdanalyze.units.convert_diff_to_power`,
-  `mean_per_row_to_period_total`, `to_per_m2` -- conversion helpers
-  following the policy: they assert input unit, perform internal
+- `etdanalyze.units.convert_diff_to_power`, `to_per_m2` -- conversion
+  helpers following the policy: they assert input unit, perform internal
   conversion as needed, return `(value, display_unit)`.
 - `etdanalyze.units._TO_PER_M2_RESCALES` -- the explicit table of
   supported internal conversions (currently kW <-> W, kWh <-> Wh).
@@ -95,8 +94,8 @@ The single source of truth for units is the etdmap data model
 ### Scope
 
 Applies to all code in `etdanalyze` and to any analysis script that
-imports its helpers (including `etdanalyze-internal` and `etdworkflow`
-callers). When migrating older callers, the loud failures surfaced by
+imports its helpers (including project-specific analysis scripts and
+data-pipeline tooling callers). When migrating older callers, the loud failures surfaced by
 these helpers are the intended outcome -- they identify the silent-trust
 bugs that the policy exists to prevent. Callers MUST update to the new
 signatures; there is no compatibility shim, by design.
@@ -165,8 +164,8 @@ draws what it is given; it does not pretend, infer, or hide absences.
    variable *should* exist for a particular project is decided by the
    data model (`etdmodel.csv`) and the supplier mapping. The report's
    job is to show what is there. If a "should-exist but doesn't" check
-   is needed for QA, it lives in a separate workflow (e.g.
-   `etdworkflow.analyze_data_report._check_required_coverage`), not in
+   is needed for QA, it lives in a separate QA workflow (a
+   required-coverage check in the data-pipeline tooling), not in
    the plot path.
 
 ### What a compliant guard looks like
@@ -237,11 +236,11 @@ for var in profile_vars:
 ### Scope
 
 Applies to every helper in `etdanalyze.plot_functions` that consumes
-data and produces a figure. Callers in `etdanalyze-internal/analysis`,
-`etdworkflow`, and any future report path must adopt the
+data and produces a figure. Callers in project-specific analysis scripts
+and the data-pipeline tooling, and any future report path must adopt the
 `classify_coverage` + skip-empty + caller-composed-title idiom. Existing
-callers that wrap plot calls in `try/except` (e.g.
-`etdworkflow/analyze_data_report.py`) continue to work -- the new
+callers that wrap plot calls in `try/except` (e.g. the mapped-data
+quality report) continue to work -- the new
 `ValueError` is just absorbed into their warning path -- but the
 strict-pattern caller idiom is the preferred shape for new code.
 
@@ -362,8 +361,8 @@ classification.
    produce interval-mean rates.
 
 8. **Override origin is not restricted.** Any caller -- a
-   built-in conversion helper, a custom analysis script in
-   `etdanalyze-internal`, an external user's notebook -- may
+   built-in conversion helper, a custom project-specific analysis
+   script, an external user's notebook -- may
    construct an override dict directly. The contract is the
    schema (rules 1-3), not the producer.
 
@@ -409,7 +408,7 @@ classification.
 Applies to every code path in `etdanalyze` that consumes a
 per-call overrides dict, every plot helper that gates on
 profile-renderability, and every caller in
-`etdanalyze-internal/analysis` or external scripts that
+project-specific analysis or external scripts that
 constructs overrides by hand. The schema change is breaking by
 design: callers passing the old `{"momentaan": True}` shape see
 a `ValueError` with a hint pointing at this ADR.

@@ -38,8 +38,8 @@ class TestComputeStatsTableSchemaParity:
 
     def test_output_columns_are_superset_of_schema(self):
         """compute_stats_table emits at least every name in
-        NUMERIC_STATS_SCHEMA. It may add extras (variable, group keys,
-        period_total) -- the contract is 'at least these'."""
+        NUMERIC_STATS_SCHEMA. It may add extras (variable, group keys)
+        -- the contract is 'at least these'."""
         out = compute_stats_table(_fixture_df(), ["g"], ["x"])
         missing = set(NUMERIC_STATS_SCHEMA) - set(out.columns)
         assert not missing, (
@@ -70,7 +70,7 @@ class TestComputeStatsTableSchemaParity:
 class TestComputeStatsTableLazyParity:
     """compute_stats_table_lazy (ibis backend) must match the pandas-eager
     compute_stats_table on the same input. Lazy validation brief on
-    real Innax data showed agreement to 1e-9; this test enforces it on
+    real project data showed agreement to 1e-9; this test enforces it on
     a small fixture for CI."""
 
     def test_output_columns_match_eager(self):

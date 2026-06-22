@@ -826,7 +826,7 @@ def classify_coverage(
 ) -> pd.DataFrame:
     """Per-(variable, group) coverage rows for the strict empty-data contract.
 
-    The Innax + general analysis pipeline asks: "for variable V, which
+    The analysis pipeline asks: "for variable V, which
     groups have actual data, and which are empty / constant?" The
     answer drives the plot-helper empty-data guards
     (plots that would receive zero rows are skipped upstream) and the
@@ -876,8 +876,8 @@ def classify_coverage(
 
     Notes
     -----
-    Mirrors the spirit of ``etdworkflow.analyze_data_report.
-    _classify_column_activity`` (per-HH x col) but works at an
+    Mirrors the spirit of the per-(HH x col) column-activity
+    classifier used in the mapped-data check report, but works at an
     arbitrary group grain so other reports / sub-tables can reuse it.
     """
     if group_cols is None:
@@ -934,10 +934,6 @@ def compute_stats_table(
         df: pd.DataFrame,
         group_cols: list,
         value_cols: list,
-        *,
-        interval: str = "60min",
-        period_days: int = 365,
-        aggregation_methods: dict | None = None,
 ) -> pd.DataFrame:
     """
     Descriptive stats for each value column grouped by group_cols.
@@ -953,35 +949,15 @@ def compute_stats_table(
     ``etdmap.mapping_helpers.compute_numeric_column_stats`` so consumers
     of either function can use the same column references.
 
-    For variables whose etdmodel ``ResamplingMethode`` is ``"sum"`` (i.e.
-    cumulative usage like kWh / liters), an extra ``period_total`` column
-    is added: the per-row mean scaled to the period's natural total via
-    ``etdanalyze.units.mean_per_row_to_period_total``. For ``"mean"`` /
-    ``"max"`` resampled variables (rates / states like degC / kW) no
-    period_total is added -- the per-row mean is already the right stat.
-
     Parameters
     ----------
     df : pd.DataFrame
-        Source DataFrame, one row per ``interval``.
+        Source DataFrame, one row per measurement interval.
     group_cols : list
         Columns to group by (e.g. ``["ProjectIdBSV"]``).
     value_cols : list
         Variables to compute stats for. Columns not in ``df`` are silently
         skipped.
-    interval : str, default ``"60min"``
-        Row interval, used to scale per-row means to period totals for
-        sum-resampled variables.
-    period_days : int, default 365
-        Days in the period being summarised. Pass 213 for
-        verwarmingsperiode (Oct-Apr), 152 for koelingsperiode (May-Sep),
-        etc. Caller filters df to the period before calling.
-    aggregation_methods : dict, optional
-        ``{var: resample_method}`` mapping to override the data-model
-        defaults. If None, pulled from
-        ``etdmap.data_model.get_aggregation_config()``. Variables absent
-        from both this map and the config default to ``"mean"`` (no
-        period_total is computed).
 
     Returns
     -------
@@ -997,19 +973,6 @@ def compute_stats_table(
     across shards. See parent ADR-017 for the full sharding /
     fallback ladder.
     """
-    if aggregation_methods is None:
-        try:
-            from etdmap.data_model import get_aggregation_config
-            cfg = get_aggregation_config()
-            aggregation_methods = {
-                var: cfg.get(var, {}).get("resample_method", "mean")
-                for var in value_cols
-            }
-        except Exception:
-            aggregation_methods = {}
-
-    from etdanalyze.units import mean_per_row_to_period_total
-
     results = []
     for col in value_cols:
         if col not in df.columns:
@@ -1024,18 +987,6 @@ def compute_stats_table(
         # here so the per-group output matches the per-Series kernel.
         stats["iqr"] = stats["p75"] - stats["p25"]
         stats.insert(0, "variable", col)
-
-        method = aggregation_methods.get(col, "mean")
-        if method == "sum":
-            stats["period_total"] = stats["mean"].apply(
-                lambda m, _col=col: (
-                    mean_per_row_to_period_total(
-                        float(m), _col, interval, period_days=period_days
-                    )[0]
-                    if pd.notna(m) else pd.NA
-                )
-            )
-
         results.append(stats)
     return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
 
@@ -1044,10 +995,6 @@ def compute_stats_table_lazy(
         tbl,
         group_cols: list,
         value_cols: list,
-        *,
-        interval: str = "60min",
-        period_days: int = 365,
-        aggregation_methods: dict | None = None,
 ) -> pd.DataFrame:
     """
     Lazy ibis variant of :func:`compute_stats_table`.
@@ -1056,8 +1003,8 @@ def compute_stats_table_lazy(
     applied lazily) and pushes ``count``, ``mean``, ``std``, ``min``,
     ``max``, ``median``, ``p01``, ``p25``, ``p75``, ``p99`` into a
     DuckDB ``group_by().aggregate(...)``. Only the small per-group
-    result is executed back to pandas. ``iqr`` and (where applicable)
-    ``period_total`` are computed in pandas on the small result.
+    result is executed back to pandas; ``iqr`` is computed in pandas on
+    the small result.
 
     Output schema matches :func:`compute_stats_table` and the canonical
     ``NUMERIC_STATS_SCHEMA`` (parent ADR-018) so the schema-parity test
@@ -1074,9 +1021,6 @@ def compute_stats_table_lazy(
     value_cols : list
         Variables to compute stats for. Columns absent from ``tbl`` are
         silently skipped.
-    interval, period_days, aggregation_methods :
-        Same semantics as :func:`compute_stats_table`. ``period_total``
-        is added in pandas after the small result is executed.
 
     Returns
     -------
@@ -1092,10 +1036,9 @@ def compute_stats_table_lazy(
     scales cleanly even on heavily-joined ibis tables (climate's
     ``join_index_table -> join_weather_data`` chain).
 
-    See ``etdworkflow/docs/performance/lazy-join-strategies-2026-05-09.md`` for
-    the per-col vs batched vs cached comparison on the real climate
-    workflow (batched is ~1.86x faster than per-col and matches the
-    hoist+pandas approach end-to-end).
+    Benchmarking on the real climate workflow (per-col vs batched vs
+    cached) showed batched is ~1.86x faster than per-col and matches
+    the hoist+pandas approach end-to-end.
 
     Use this function when the caller has an ibis Table (with whatever
     upstream joins / filters / projections already applied lazily) and
@@ -1104,18 +1047,6 @@ def compute_stats_table_lazy(
     caller already has a pandas DataFrame in hand (e.g. because a
     later plot or Excel block needs it materialised regardless).
     """
-    from etdanalyze.units import mean_per_row_to_period_total
-    if aggregation_methods is None:
-        try:
-            from etdmap.data_model import get_aggregation_config
-            cfg = get_aggregation_config()
-            aggregation_methods = {
-                var: cfg.get(var, {}).get("resample_method", "mean")
-                for var in value_cols
-            }
-        except Exception:
-            aggregation_methods = {}
-
     available_cols = [c for c in value_cols if c in tbl.columns]
     if not available_cols:
         return pd.DataFrame()
@@ -1124,7 +1055,6 @@ def compute_stats_table_lazy(
     # joins and the parquet scan are computed once per call instead of
     # once per variable. On the climate workflow (3 vars per call, index +
     # weather joins) this is ~1.9x faster than the per-variable version.
-    # See etdworkflow/docs/performance/lazy-join-strategies-2026-05-09.md.
     agg_exprs: dict = {}
     for col in available_cols:
         e = tbl[col]
@@ -1153,18 +1083,6 @@ def compute_stats_table_lazy(
         sub["iqr"] = sub["p75"] - sub["p25"]
         sub = sub[sub["count"].fillna(0) > 0].copy()
         sub.insert(0, "variable", col)
-
-        method = aggregation_methods.get(col, "mean")
-        if method == "sum":
-            sub["period_total"] = sub["mean"].apply(
-                lambda m, _col=col: (
-                    mean_per_row_to_period_total(
-                        float(m), _col, interval, period_days=period_days
-                    )[0]
-                    if pd.notna(m) else pd.NA
-                )
-            )
-
         results.append(sub)
     return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
 
@@ -1219,6 +1137,11 @@ def fit_heat_signature(
             Slope of the heating regression line (kWh per °C).
         heating_intercept : float or None
             Intercept of the heating regression line.
+        heating_slope_se : float or None
+            Standard error of the heating slope (precision of the slope
+            estimate). None when fewer than 3 heating points or x has no
+            spread. Use for inverse-variance weighting downstream -- this,
+            not r2, is the principled measure of slope precision.
         dhw_level : float or None
             Mean energy level of the DHW / base region.
         stookgrens : float or None
@@ -1250,9 +1173,13 @@ def fit_heat_signature(
         dhw_df = df[df[temp_col] >= cutoff]
 
     def _ols(sub: pd.DataFrame) -> tuple:
-        """Return (slope, intercept, r2) from two Series using pandas operations."""
+        """Return (slope, intercept, r2, slope_se) from two Series using
+        pandas operations. slope_se is the standard error of the slope -- the
+        principled precision measure for the slope estimate (unlike r2, which
+        is goodness-of-fit). None when there are too few points (n < 3) or x
+        has no spread, since SE needs n-2 >= 1 residual degrees of freedom."""
         if len(sub) < 2:
-            return None, None, None
+            return None, None, None, None
         x = sub[temp_col]
         y = sub[energy_col]
         slope = x.cov(y) / x.var()
@@ -1261,9 +1188,13 @@ def fit_heat_signature(
         ss_res = ((y - y_hat) ** 2).sum()
         ss_tot = ((y - y.mean()) ** 2).sum()
         r2 = (1 - ss_res / ss_tot) if ss_tot > 0 else pd.NA
-        return slope, intercept, r2
+        # SE(slope) = sqrt( (SSE / (n-2)) / Sxx ), Sxx = sum((x-xbar)^2).
+        n = len(sub)
+        sxx = ((x - x.mean()) ** 2).sum()
+        slope_se = ((ss_res / (n - 2)) / sxx) ** 0.5 if (n > 2 and sxx > 0) else None
+        return slope, intercept, r2, slope_se
 
-    h_slope, h_intercept, h_r2 = _ols(heating_df)
+    h_slope, h_intercept, h_r2, h_slope_se = _ols(heating_df)
     dhw_level = dhw_df[energy_col].mean() if len(dhw_df) >= 1 else None
 
     stookgrens = None
@@ -1273,6 +1204,7 @@ def fit_heat_signature(
     return {
         "heating_slope": h_slope,
         "heating_intercept": h_intercept,
+        "heating_slope_se": h_slope_se,
         "dhw_level": dhw_level,
         "stookgrens": stookgrens,
         "r2_heating": h_r2,

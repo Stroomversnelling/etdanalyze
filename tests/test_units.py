@@ -18,7 +18,6 @@ from etdanalyze.units import (
     convert_interval_diff,
     infer_interval,
     is_renderable_on_profile,
-    mean_per_row_to_period_total,
     power_display_name,
     resolve_unit,
     to_per_m2,
@@ -356,48 +355,6 @@ class TestConvertDiffToPower:
         series = pd.Series([1.0], dtype="Float64")
         with pytest.raises(KeyError, match="No unit known"):
             convert_diff_to_power(series, "__not_in_data_model__", "5min")
-
-
-# ---------------------------------------------------------------------------
-# mean_per_row_to_period_total
-# ---------------------------------------------------------------------------
-
-
-class TestMeanPerRowToPeriodTotal:
-    def test_kwh_annual_total(self):
-        # mean of 1 kWh per 60-min row over 365 days = 8760 kWh/year.
-        total, unit = mean_per_row_to_period_total(
-            1.0, "ElektriciteitNetgebruikHoog", "60min",
-        )
-        assert unit == "kWh"
-        assert total == pytest.approx(8760.0)
-
-    def test_unit_passes_through(self):
-        # mean 0.5 m3 per row over 365 days at hourly interval = 4380 m3/year.
-        total, unit = mean_per_row_to_period_total(
-            0.5, "Gasgebruik", "60min",
-        )
-        assert unit == "m3"
-        assert total == pytest.approx(0.5 * 365 * 24)
-
-    def test_override_for_synthetic_column(self):
-        total, unit = mean_per_row_to_period_total(
-            2.0, "my_synthetic_liters_col", "60min",
-            overrides={"my_synthetic_liters_col": "liter"},
-        )
-        assert unit == "liter"
-        assert total == pytest.approx(2.0 * 365 * 24)
-
-    def test_custom_period_days(self):
-        # Heating season ~ 213 days (Oct-Apr).
-        total, _unit = mean_per_row_to_period_total(
-            1.0, "ElektriciteitNetgebruikHoog", "60min", period_days=213,
-        )
-        assert total == pytest.approx(213 * 24)
-
-    def test_unknown_column_raises(self):
-        with pytest.raises(KeyError, match="No unit known"):
-            mean_per_row_to_period_total(1.0, "__not_a_real_column__", "60min")
 
 
 # ---------------------------------------------------------------------------

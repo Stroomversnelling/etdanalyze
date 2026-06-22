@@ -1,249 +1,243 @@
-# Plot helpers design notes
+# Plotting helpers: design and conventions
 
-This is a descriptive walk-through of how the plot helpers in
-`etdanalyze.plot_functions` and the supporting utilities in
-`etdanalyze.analysis_helpers` have been put together up to this point.
-It is not a set of rules. It is meant to give a future contributor
-enough context to decide where it makes sense to follow the established
-pattern and where there is a good reason to depart from it.
+How the plotting helpers in `etdanalyze.plot_functions` and the data
+utilities in `etdanalyze.analysis_helpers` fit together, and the
+conventions a new helper should follow. These are conventions, not laws:
+they exist so plots look consistent and callers can guess a signature
+before reading it. Depart from them when you have a reason, and say why.
 
-## 1. Module shape
+## Quick start
 
-There are two modules involved:
+Pick a numeric column to plot, the categorical column for the x-axis, and
+the categorical column for colour. The helper resolves the unit from the
+ETD data model and labels the axes for you.
 
-- `etdanalyze/plot_functions.py` -- rendering. Functions that produce
-  matplotlib figures and (typically) save them as PNG. This is where
-  boxplots, daily/weekly/annual profiles, scatter plots, energy
-  signatures, and load-duration curves live.
-- `etdanalyze/analysis_helpers.py` -- data utilities. Functions that
-  filter, aggregate, normalise, or summarise dataframes. They have no
-  side effects on figures or files.
+```python
+import pandas as pd
+from etdanalyze.plot_functions import plot_boxwhisker_comparison
 
-The split is by side effect: `plot_functions` writes images and prints
-analysis lines; `analysis_helpers` returns dataframes. When a piece of
-logic could fit either module (e.g. outlier detection), the test is
-"does it draw or save anything?" -- if no, it goes in
-`analysis_helpers`.
+# df: one row per household, with the value plus its grouping columns.
+plot_boxwhisker_comparison(
+    df,
+    value_col="median_kwh",          # y-axis numeric
+    x_group="ProjectIdBSV",          # categories along x
+    color_group="WoningType",        # colour coding
+    column_name="ElektriciteitNetgebruikHoog",  # -> unit + title text
+    x_order=sorted(df["ProjectIdBSV"].unique()),  # numeric order, not 1,10,2
+    save_fig_path="plots/elek__annual.png",
+)
+```
+
+`save_fig_path` is the universal switch: pass a path and the helper writes
+a PNG and returns `None`; omit it and the helper returns the matplotlib
+`Figure` so you can keep tweaking it.
+
+## 1. Two modules, split by side effect
+
+- **`plot_functions.py` -- rendering.** Functions that build matplotlib
+  figures and usually save them as PNG: boxplots, daily/weekly/annual
+  profiles, scatter plots, energy signatures, load-duration curves.
+- **`analysis_helpers.py` -- data.** Functions that filter, aggregate,
+  normalise, or summarise dataframes. No figures, no files, no printing.
+
+The dividing question for a new function is "does it draw or save
+anything?" If no, it belongs in `analysis_helpers`, even when it exists
+only to feed a plot (outlier detection is the classic example: detection
+returns a table in `analysis_helpers`; the decision to draw a marker for
+it lives in `plot_functions`).
 
 ## 2. Helper signature conventions
 
-Most of the existing rendering helpers share a similar argument
-shape:
+Most rendering helpers share the same argument vocabulary, so once you
+know one you can read the rest:
 
-- `df` -- the input DataFrame, one row per observation unit
-  (typically per household or per (household, ReadingDate)).
-- `value_col`, `x_group`, `color_group` -- the three semantic
-  axes of the plot. `value_col` is the y-axis numeric. `x_group`
-  is the categorical column laid out along x (e.g. `ProjectIdBSV`).
-  `color_group` is the categorical that drives colour coding.
-- `id_col` -- identifier for individual observations (default
-  `"HuisIdBSV"`). Used by helpers that overlay specific
-  observations (e.g. outlier markers).
-- `column_name` (optional) -- the ETD model column being plotted.
-  When given, the helper looks up its unit from
-  `etdmap.data_model.load_unit_map()` and appends the unit to the
-  y-axis label and title.
-- `save_fig_path` -- when set, the helper saves the figure to that
-  path and returns `None`. When unset, it returns the figure
-  object so the caller can do its own thing.
+| Argument | Role |
+| --- | --- |
+| `df` | Input frame, one row per observation unit (per household, or per `(household, ReadingDate)`). |
+| `value_col` | The y-axis numeric. |
+| `x_group` | Categorical laid out along x (e.g. `"ProjectIdBSV"`). |
+| `color_group` | Categorical that drives colour. |
+| `id_col` | Identifier for a single observation (default `"HuisIdBSV"`); used by overlays such as outlier markers. |
+| `column_name` | The ETD model column being plotted. Drives unit lookup and title/label text (see §3). |
+| `overrides` | Per-call `{column: unit}` map for columns outside the data model (see §3). |
+| `save_fig_path` | Set -> save PNG, return `None`. Unset -> return the `Figure`. |
 
-`plot_boxwhisker_comparison` is the most parameter-rich helper and
-illustrates the convention. The simpler helpers (e.g.
-`plot_load_duration_curve`) take a subset of these parameters.
+`plot_boxwhisker_comparison` is the richest example and exercises the full
+set. Simpler helpers take a subset -- `plot_load_duration_curve` only
+needs the frame, a diff column, and an interval:
+
+```python
+plot_load_duration_curve(
+    df,
+    diff_column="ElektriciteitsgebruikTotaalNettoDiff",
+    interval="hourly",
+    project_id=3,
+    save_fig_path="plots/ldc__project3.png",
+)
+```
 
 ## 3. Units and labels
 
-`etdmap/data/thresholds.csv` is the project-wide source of truth for
-variable units (column `Eenheid`). It is loaded once via
-`etdmap.data_model.load_unit_map()`, which returns a
-`{variable_name: unit_string}` dict. `plot_functions.py` caches it at
-import time as `_UNIT_MAP` and exposes two small helpers:
+Units come from one source of truth: `etdmap.data_model.load_unit_map()`,
+a `{column: unit}` dict that `plot_functions` caches once at import time
+as `_UNIT_MAP`. Three helpers sit on top of it:
 
-- `unit_for_column(col) -> str` -- the unit, or `""` if unknown.
-- `axis_label_with_unit(col, base_label) -> str` -- the base label
-  with `" (unit)"` appended when a unit is known.
+- `unit_for_column(col) -> str` -- low-level lookup; returns `""` for an
+  unknown column.
+- `resolve_unit(col, overrides=None) -> str` -- the helper to use. Strict
+  by default and override-aware.
+- `axis_label_with_unit(col, base_label, overrides=None) -> str` -- builds
+  `"base_label (unit)"`, or just `base_label` when the unit is `""`.
 
-Helpers can opt in by accepting a `column_name` argument and using
-either of the above. Today not every helper does; the ones that have
-been touched recently (`plot_boxwhisker_comparison`,
-`plot_load_duration_curve`) do.
+`resolve_unit` is **strict**: it checks `overrides` first, then the data
+model, and **raises `KeyError`** if neither knows the column. There is no
+silent blank fallback -- a missing unit is a bug that should surface
+loudly, not a label that quietly drops its unit. The two reasons to pass
+`overrides` are (a) a derived variable that is not in the data model, and
+(b) a display-unit variant whose unit changed upstream (e.g. a `Diff`
+column converted from kWh to kW). An empty-string override is meaningful:
+it declares the value genuinely unitless.
 
-## 4. Outlier handling: detection vs rendering, and the two detection styles
+```python
+>>> axis_label_with_unit("ElektriciteitNetgebruikHoog", "median value")
+'median value (kWh)'
 
-Outlier *detection* and outlier *rendering* are separated. Detection
-returns a dataframe; rendering decides whether to draw markers, list
-them in a side table, annotate inline, or omit entirely.
+# derived variant now in kW after convert_diff_to_power:
+>>> axis_label_with_unit(
+...     "ElektriciteitNetgebruikHoogDiff", "median",
+...     overrides={"ElektriciteitNetgebruikHoogDiff": "kW"},
+... )
+'median (kW)'
 
-There are **two complementary detection styles** in `analysis_helpers`,
-named for the question they answer:
+# explicitly unitless:
+>>> axis_label_with_unit("COP", "COP", overrides={"COP": ""})
+'COP'
+```
 
-### `build_outlier_table` (Tukey + z-score fallback)
+Helpers opt in by accepting `column_name` (and `overrides`) and feeding
+them to `resolve_unit`. When a helper owns the unit this way, do **not**
+pre-stamp a unit into the title text yourself -- you will get a doubled
+unit, which is the intended loud failure mode.
 
-- Question: "is this value unusual *relative to its cohort
-  distribution*?"
-- Method: Tukey fence (Q1 - 1.5*IQR, Q3 + 1.5*IQR) within each
-  group. Falls back to a z-score test (>2.5) when the group has
-  fewer than 4 points or the IQR is zero.
-- Best for: spotting per-project anomalies where the cohort has a
-  reasonably symmetric distribution and a small number of unusual
-  observations stand out from neighbours.
-- Output: long-form table with columns `id_col`, `*group_cols`,
-  `value`, `group_median`, `z_score`, sorted by `|z_score|`
-  descending.
+## 4. Outlier detection: two styles for two questions
 
-### `build_extreme_value_table` (percentile-bounds)
+Detection and rendering are separate. `analysis_helpers` returns a table
+of flagged rows; the caller decides whether to draw markers, list them in
+a side table, annotate them, or ignore them. There are two detection
+helpers because there are two different questions:
 
-- Question: "is this value so extreme that it dwarfs the bulk of
-  the data, regardless of distribution shape?"
-- Method: q99 * 10 for the high bound, q01 * 10 for the low bound
-  when q01 is itself negative (otherwise the low bound is 0).
-  Mirrors `filter_between_upper_lower_bounds` (which is the
-  underlying filter that returns surviving rows rather than
-  flagging outliers).
-- Best for: energy variables. They are typically right-skewed,
-  with legitimate large values at the tails. Tukey would flag
-  every healthy peak; q99*10 only flags the truly abnormal.
-  Robust to non-normality. Designed for sufficiently large
-  samples (hundreds of observations per group); will not work
-  meaningfully on per-project summary frames with ~10 rows per
-  project, because the q99 itself coincides with the outlier.
-- Output: long-form table with columns `id_col`, `*group_cols`,
-  `value`, `bound_low`, `bound_high`, `direction`
-  (`"above"` / `"below"`), sorted by absolute distance from the
-  violated bound.
+**`build_outlier_table` -- "is this value unusual relative to its
+cohort?"** Tukey fence (`Q1 - 1.5*IQR`, `Q3 + 1.5*IQR`) within each group,
+falling back to a z-score test (`> 2.5`) when a group has fewer than four
+points or a zero IQR. Best when the cohort is roughly symmetric and a few
+points stand out from their neighbours.
 
-The two are not interchangeable. Use `build_outlier_table` when you
-want to flag rows that stand out from neighbours. Use
-`build_extreme_value_table` when you want to clip values that would
-visually dominate downstream calculations.
+```python
+out = build_outlier_table(
+    df,
+    value_col="median_kwh",
+    group_cols=("Dataleverancier", "ProjectIdBSV"),
+    top_n=10,
+)
+# columns: id_col, *group_cols, value, group_median, z_score
+# sorted by |z_score| desc; empty frame when nothing is flagged.
+```
 
-`etdanalyze-internal/analysis/analysis_helpers.py
-.filter_and_report_outliers` uses the percentile-bounds method and
-adds two side effects: it tags an `is_outlier` boolean column on the
-input dataframe and prints a summary of removed values to stdout.
-That is appropriate for the load-duration curve workflow it serves
-(reviewers want to see exactly which timestamps were dropped). The
-generic `build_*` helpers in `analyze` deliberately do not print or
-mutate; they return tables and let the caller decide.
+**`build_extreme_value_table` -- "is this value so extreme it dwarfs the
+bulk of the data?"** Percentile bounds: high bound `q99 * 10`, low bound
+`q01 * 10` when `q01` is negative (otherwise `0`). Robust to skew, so it
+suits right-skewed energy variables where Tukey would flag every healthy
+peak. It needs a reasonably large sample (hundreds of rows per group); on
+a ~10-row-per-project summary frame the `q99` coincides with the outlier
+and nothing useful comes out.
 
-Rendering choices -- markers, side tables, inline annotations -- are
-made by each caller. The mapping report draws X markers on the
-boxplot for outliers and emits a markdown table beneath the image;
-the load-duration curve in etdanalyze-internal draws red dashed
-verticals at outlier positions. These are local choices, not rules.
+```python
+ext = build_extreme_value_table(df, value_col="ElektriciteitsgebruikTotaalNettoDiff")
+# columns: id_col, *group_cols, value, bound_low, bound_high, direction
+# direction is "above" / "below"; sorted by distance from the violated bound.
+```
 
-## 5. Range / cluster detection as metadata
+The two are not interchangeable: reach for `build_outlier_table` to flag
+rows that stand out from neighbours, and `build_extreme_value_table` to
+catch values that would visually dominate a chart or a downstream sum.
 
-`detect_value_range_clusters(per_group_values)` answers a different
-question: "do the per-group values fall into N visibly separate
-ranges (orders of magnitude apart)?" It returns a list of cluster
-key sets ordered by ascending cluster median:
+Both helpers are pure -- they return a table and never print or mutate the
+input. A caller that wants side effects (tagging an `is_outlier` column,
+printing which timestamps were dropped) builds that on top.
 
-- length 1: no meaningful split, all groups are one range
-- length 2+: N clusters, each with its own member set
+## 5. Range clusters: detection as metadata
 
-The detection itself is just metadata. It does not decide what to
-do about the split. Callers can:
+`detect_value_range_clusters(per_group_min, per_group_max)` answers yet
+another question: "do these groups fall into separate value ranges that a
+single shared y-axis would squash?" It takes a per-group min and a
+per-group max Series and returns a list of key-sets:
 
-- emit one PNG per cluster (the mapping report's choice -- so each
-  cluster gets its own y-axis and the smaller boxes are not
-  squashed by the largest);
-- use a log y-scale on a single plot (loses relative-magnitude
-  intuition but keeps everything in one image);
-- annotate the largest gap on a single plot;
-- ignore it entirely.
+```python
+mins = df.groupby("ProjectIdBSV")["value"].min()
+maxs = df.groupby("ProjectIdBSV")["value"].max()
+clusters = detect_value_range_clusters(mins, maxs)
+# [] -> no groups
+# [{1, 2, 3}] -> one range, plot normally
+# [{1, 2}, {3, 4}] -> two ranges, ordered by ascending cluster max
+```
 
-The mapping report's choice is to emit one PNG per cluster with
-sequence-numbered filenames `<column>__<season>__<i>.png` in
-ascending median order. That is a *report* decision; nothing in
-`detect_value_range_clusters` requires it.
-
-A future direction would be `summarize_value_ranges` returning a
-richer metadata dict (per-cluster boundaries, spreads, separation
-score) plus a `facet_by(plot_fn, ...)` wrapper that takes any plot
-helper and an arbitrary partitioning rule. Both are deferred until a
-second consumer needs them.
+A group is judged "cramped" when its own range is a tiny fraction of its
+cluster's y-axis span, or when an all-positive cluster spans more than two
+orders of magnitude (the small boxes would collapse to a line at the axis
+edge). The function only reports the split; it does not act on it. A
+caller can emit one figure per cluster (each with its own y-axis), switch
+to a log scale, annotate the largest gap, or ignore the result entirely.
 
 ## 6. Layout: stacked subplots, twinx, constrained_layout
 
-The current convention for layout:
+- Create figures with `plt.subplots(..., constrained_layout=True)` rather
+  than calling `plt.tight_layout()` afterwards. `tight_layout` fights with
+  secondary axes, external legends, and multi-row figures, and emits noisy
+  `UserWarning`s.
+- To show a companion metric alongside the main plot, use a **stacked
+  subplot row** that shares the x-axis, not `twinx()`. Give the primary
+  plot the larger share with `gridspec_kw={"height_ratios": [3, 1]}`:
 
-- Figures use `constrained_layout=True` at `plt.subplots()` time
-  rather than a post-hoc `plt.tight_layout()` call. The latter
-  fights with secondary axes, externally placed legends, and
-  multi-row figures, and produces UserWarnings that get noisy.
-- When a helper needs to show a companion metric (e.g.
-  validate_fail_rate next to value distribution), the convention
-  is a **stacked subplot row** sharing the x-axis (typically with
-  `gridspec_kw={"height_ratios": [3, 1]}` so the primary plot
-  dominates), not `twinx()`.
-- `twinx()` is not forbidden. It is the right choice when two
-  metrics share a meaningful coupling that a separate subplot
-  would lose -- for instance a journalism-style explanatory chart
-  where two scales must literally overlay. A helper that uses
-  `twinx` should either be its own dedicated plot type or expose
-  the choice through an explicit kwarg.
+  ```python
+  fig, (ax_main, ax_aux) = plt.subplots(
+      2, 1, sharex=True,
+      gridspec_kw={"height_ratios": [3, 1]},
+      constrained_layout=True,
+  )
+  ```
 
-`plot_boxwhisker_comparison` switches between single-axis and
-two-row stacked layout based on whether `secondary_axis_data` is
-provided. It does not use `twinx`.
+  `plot_boxwhisker_comparison` does exactly this when
+  `secondary_axis_data` is passed: the box distribution sits on top and
+  the companion metric (e.g. a validation fail-rate) sits beneath.
+- `twinx()` is not banned, but reserve it for the rare case where two
+  metrics genuinely share one coordinate space and must overlay. A helper
+  that uses it should be a dedicated plot type or gate it behind an
+  explicit kwarg.
 
-## 7. Filename conventions (mapping report)
+## 7. Style defaults
 
-The mapping report writes plot PNGs into a `plots/` subfolder of
-its output directory. The schema has two cases:
+Helpers tend to converge on these; override locally when a plot type needs
+a different look (heatmaps, time series, energy signatures do).
 
-- `<column>__<season>.png` -- one plot for the whole cohort.
-- `<column>__<season>__<i>.png` for `i = 1..N` -- N plots when
-  the report decided to split a multi-range cohort. Sequence
-  ordered by ascending cluster median (1 = lowest range).
+- **DPI:** 150 for report-oriented output, 300 where print quality
+  matters.
+- **Colormap:** `tab10` for up to 10 categorical groups, cycling beyond
+  that.
+- **Figure width:** scale with the number of x-categories, e.g.
+  `max(8.0, n_x * 1.6 + 2.0)`.
 
-`<season>` is one of `annual`, `cold`, `warm`. The mapping report
-runs a hygiene pass at the start of `main()` that deletes any PNG
-in the plot folder that does not match this schema, so the folder
-stays self-consistent across runs.
+## 8. Out of scope (deliberately)
 
-Other consumers are not bound by this. Any plot output produced by
-`etdanalyze.plot_functions` callers can use whatever filename
-convention makes sense for that consumer; only the mapping report's
-plot folder enforces the schema.
+What this library does not do yet, so a reader knows where the edges are.
+Each is a fair candidate for future work once a concrete caller needs it.
 
-## 8. Style constants
-
-Defaults that the helpers tend to converge on:
-
-- DPI 150 for `savefig` (the mapping report uses 150; some other
-  helpers use 300 for higher-quality print output).
-- `tab10` colormap for categorical groupings up to 10 categories.
-  Helpers cycle wrap when `color_group` has more than 10
-  categories.
-- Figure widths scale with the number of x-categories
-  (`max(8.0, n_x * 1.6 + 2.0)` is a common pattern).
-
-These are conventions, not requirements. Helpers that need a
-different look (heatmaps, time series, energy signatures) override
-locally.
-
-## 9. What this codebase does not solve yet
-
-For honest scoping:
-
-- **Faceting.** No general `facet_by` wrapper. When a helper
-  needs to produce several plots from one input (e.g. one per
-  cluster), the caller currently writes the iteration loop.
-- **Project-wide style theme.** No central matplotlib rcParams
-  preset. Each helper sets its own colours, font sizes, grid
-  styles inline.
-- **Dark mode / accessibility.** No alternative palettes for
-  colour-blind viewers; no dark-background variant.
-- **Interactive plots.** Everything is static PNG. No plotly /
-  bokeh helpers.
-- **Automatic legend placement** at `n_color_group > 10`. The
-  current `bbox_to_anchor=(1.01, 1)` external legend works for a
-  handful of categories; large category counts overflow.
-- **Caching.** Helpers re-render every time. Some report
-  generators wipe and rebuild their entire plot folder per run.
-
-These are flagged so a reader knows what is intentionally
-out-of-scope. They are good candidates for future work when a
-concrete consumer needs them.
+- **Faceting.** No general `facet_by` wrapper; a caller that needs several
+  plots from one frame writes its own loop.
+- **Central theme.** No shared matplotlib `rcParams`; each helper sets its
+  own colours, fonts, and grid inline.
+- **Accessibility / dark mode.** No colour-blind-safe or dark palettes.
+- **Interactivity.** Static PNG only -- no plotly/bokeh.
+- **Legend placement at scale.** The external
+  `bbox_to_anchor=(1.01, 1)` legend works for a handful of categories and
+  overflows past ~10.
+- **Caching.** Helpers re-render on every call.

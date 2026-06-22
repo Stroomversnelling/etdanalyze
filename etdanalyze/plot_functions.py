@@ -499,7 +499,7 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
 
     # Axis labels and formatting
     ax.set_ylabel(plot_var_name, color="purple")
-    ax.set_xlabel("Time of Day")
+    ax.set_xlabel("Time of Day (UTC)")
     ax.tick_params(axis="y", labelcolor="purple")
 
     # Format x-axis to show time
@@ -614,7 +614,7 @@ def plot_daily_profile_bands(
     ax.plot(summary["hour_of_day"], summary["mean"],
             linewidth=2, color="purple", label="mean")
 
-    ax.set_xlabel("Hour of day")
+    ax.set_xlabel("Hour of day (UTC)")
     ax.set_ylabel(axis_label_with_unit(plot_var, plot_var_name, overrides=overrides))
     ax.set_xticks(range(0, 24, 2))
     ax.set_xticklabels([f"{h:02d}:00" for h in range(0, 24, 2)])
@@ -739,7 +739,7 @@ def plot_daily_profile_mean_combined(
             color=color
         )
 
-    ax.set_xlabel("Tijd")
+    ax.set_xlabel("Tijd (UTC)")
     # y-label: caller override wins; otherwise look up the first variable's
     # unit (using its converted unit if Diff conversion ran). Mixing
     # variables with different units in one plot is the caller's call --
@@ -874,7 +874,7 @@ def plot_weekly_profile(
     for day in range(7):
         ax.axvline(day * 24, color="gray", linewidth=0.5, linestyle="--")
 
-    ax.set_xlabel("Day of week / hour")
+    ax.set_xlabel("Day of week / hour (UTC)")
     ax.set_ylabel(axis_label_with_unit(plot_var, plot_var_name, overrides=overrides))
     ax.xaxis.set_major_locator(mticker.MultipleLocator(24))
     ax.xaxis.set_major_formatter(mticker.FuncFormatter(
@@ -984,7 +984,7 @@ def plot_annual_profile(
         ax.axvline(start, color="gray", linewidth=0.4, linestyle="--")
         ax.text(start + 0.5, ax.get_ylim()[1], name, fontsize=7, color="gray", va="top")
 
-    ax.set_xlabel("Day of year")
+    ax.set_xlabel("Day of year (UTC)")
     ax.set_ylabel(axis_label_with_unit(plot_var, plot_var_name, overrides=overrides))
     ax.legend()
     plt.title(title or f"Annual profile: {plot_var_name}")
@@ -1545,7 +1545,7 @@ def plot_monthly_profile(
     ax.set_yticks(range(0, 24, 2))
     ax.set_yticklabels([f"{h:02d}:00" for h in range(0, 24, 2)])
     ax.set_xlabel("Month")
-    ax.set_ylabel("Hour of day")
+    ax.set_ylabel("Hour of day (UTC)")
     plt.title(title or f"Monthly profile: {plot_var_name}")
     plt.tight_layout()
 
@@ -1615,10 +1615,14 @@ def _draw_boxes(
         max_per_box = max((len(d) for d in box_data), default=0)
         effective_scatter = "all" if max_per_box <= _SCATTER_AUTO_THRESHOLD else "matplotlib"
 
-    # Filled-dot fliers in "matplotlib" mode; everything else
+    # Cross-style fliers in "matplotlib" mode; everything else
     # suppresses native fliers (custom overlay below, or nothing).
+    # Outliers render as an "x" (not the filled "o" dot) so they read
+    # clearly as outliers rather than as data points (reviewer comment
+    # 12). matplotlib's rcParam default flier marker is "o", so the "x"
+    # is set explicitly here.
     if effective_scatter == "matplotlib":
-        flierprops = dict(marker="o", markersize=4, linestyle="none")
+        flierprops = dict(marker="x", markersize=4, linestyle="none")
     else:
         flierprops = dict(marker="none")
 
@@ -1753,6 +1757,7 @@ def plot_boxwhisker_comparison(
         xtick_prefix: str = "",
         scatter: str = "auto",
         grouping_col: Optional[str] = None,
+        x_order: Optional[list] = None,
 ) -> Optional[plt.Figure]:
     """
     Box-and-whisker plot with jittered scatter overlay for distribution
@@ -1786,6 +1791,16 @@ def plot_boxwhisker_comparison(
         Categorical column for x-axis positioning (e.g. 'ProjectIdBSV').
     color_group : str
         Categorical column for dot colour coding.
+    x_order : list, optional
+        Explicit left-to-right order for the x-axis categories (and, when
+        ``color_group == x_group``, the colour legend). Opt-in: when omitted
+        the categories keep the default **alphabetical** order
+        (``sorted(..., key=str)``) -- so for numeric groups like
+        ``ProjectIdBSV`` pass ``x_order=sorted(df[x_group].unique())`` to get
+        1, 2, ... 10, 11 instead of 1, 10, 11, 2. Categories present in the
+        data but absent from ``x_order`` are appended in alphabetical order so
+        none are silently dropped; entries in ``x_order`` with no observations
+        do not appear (the legend/x-axis honesty rule below still holds).
     title : str, optional
         Title TEMPLATE rendered via ``str.format()``. Available
         placeholders:
@@ -1889,8 +1904,24 @@ def plot_boxwhisker_comparison(
     # Legend honesty: x_cats / c_cats are built from values that actually
     # survive the dropna above, so a (project, woningtype) combo with no
     # observations never reaches the legend or the x-axis.
-    x_cats = sorted(plot_df[x_group].dropna().unique().tolist(), key=str)
-    c_cats = sorted(plot_df[color_group].dropna().unique().tolist(), key=str)
+    #
+    # Order: default is alphabetical (key=str). An optional caller-supplied
+    # x_order overrides it -- listed categories first (only those present),
+    # then any present-but-unlisted ones alphabetically so nothing is dropped.
+    present_x = plot_df[x_group].dropna().unique().tolist()
+    if x_order is not None:
+        listed = [c for c in x_order if c in set(present_x)]
+        extra = sorted([c for c in present_x if c not in set(x_order)], key=str)
+        x_cats = listed + extra
+    else:
+        x_cats = sorted(present_x, key=str)
+    # When colour == x-axis the legend follows the same order (boxes and
+    # legend agree); otherwise the colour legend stays alphabetical. With
+    # x_order=None this reproduces the previous behaviour exactly.
+    if color_group == x_group:
+        c_cats = list(x_cats)
+    else:
+        c_cats = sorted(plot_df[color_group].dropna().unique().tolist(), key=str)
 
     cmap = matplotlib.colormaps.get_cmap("tab10")
     c_colors = {cat: cmap(i % 10) for i, cat in enumerate(c_cats)}
