@@ -18,6 +18,7 @@ from etdanalyze.plot_functions import (
     unit_for_column,
 )
 from etdanalyze.analysis_helpers import (
+    build_distribution_table,
     build_extreme_value_table,
     build_outlier_table,
     sort_load,
@@ -646,3 +647,105 @@ class TestPlotHouseholdRangeStrips:
         out = tmp_path / "strips_minimal.png"
         plot_range_strips_candlestick(df, save_fig_path=str(out))
         assert out.exists() and out.stat().st_size > 0
+
+
+# ---------------------------------------------------------------------------
+# build_distribution_table  (report-ready per-(group, period) stats table)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDistributionTable:
+    """Stacked per-(group, period) distribution stats with a population
+    roll-up row per period. Returns a tidy frame ready for .to_markdown()."""
+
+    _COLS = ["period", "ProjectIdBSV", "WoningType",
+             "n", "gem.", "med.", "p25", "p75", "min", "max"]
+
+    def _frame(self):
+        # P1/A/year: 10,20,30 ; P2/B/year: 40,60 ; P1/A/verw: 100,200.
+        # One 'zomer' row that is NOT in the periods we request -> dropped.
+        return pd.DataFrame({
+            "ProjectIdBSV": [1, 1, 1, 2, 2, 1, 1, 1],
+            "WoningType":   ["A", "A", "A", "B", "B", "A", "A", "A"],
+            "period":       ["year", "year", "year", "year", "year",
+                             "verwarmingsperiode", "verwarmingsperiode", "zomer"],
+            "val":          [10.0, 20.0, 30.0, 40.0, 60.0, 100.0, 200.0, 999.0],
+        })
+
+    def _row(self, out, **eq):
+        mask = pd.Series(True, index=out.index)
+        for k, v in eq.items():
+            mask &= out[k] == v
+        sub = out[mask]
+        assert len(sub) == 1, f"expected exactly one row for {eq}, got {len(sub)}"
+        return sub.iloc[0]
+
+    def test_schema_columns_exact_order(self):
+        out = build_distribution_table(
+            self._frame(), "val", periods=("year", "verwarmingsperiode"))
+        assert list(out.columns) == self._COLS
+
+    def test_empty_when_no_matching_period_preserves_columns(self):
+        out = build_distribution_table(
+            self._frame(), "val", periods=("no_such_period",))
+        assert out.empty
+        assert list(out.columns) == self._COLS
+
+    def test_per_group_stats_are_correct(self):
+        out = build_distribution_table(
+            self._frame(), "val", periods=("year", "verwarmingsperiode"))
+        r = self._row(out, period="year", ProjectIdBSV=1, WoningType="A")
+        assert int(r["n"]) == 3
+        assert r["gem."] == pytest.approx(20.0)
+        assert r["med."] == pytest.approx(20.0)
+        assert r["p25"] == pytest.approx(15.0)
+        assert r["p75"] == pytest.approx(25.0)
+        assert r["min"] == pytest.approx(10.0)
+        assert r["max"] == pytest.approx(30.0)
+
+    def test_population_rollup_aggregates_across_all_households(self):
+        out = build_distribution_table(
+            self._frame(), "val", periods=("year", "verwarmingsperiode"))
+        # Roll-up row: first group col holds the label, the rest are blank.
+        r = self._row(out, period="year", ProjectIdBSV="alle HHs")
+        assert r["WoningType"] == ""
+        assert int(r["n"]) == 5                      # 10,20,30,40,60
+        assert r["gem."] == pytest.approx(32.0)
+        assert r["med."] == pytest.approx(30.0)
+        assert r["min"] == pytest.approx(10.0)
+        assert r["max"] == pytest.approx(60.0)
+
+    def test_out_of_scope_periods_are_dropped(self):
+        out = build_distribution_table(
+            self._frame(), "val", periods=("year", "verwarmingsperiode"))
+        assert "zomer" not in set(out["period"])
+        assert 999.0 not in set(out["max"])
+
+    def test_periods_ordered_within_a_group(self):
+        out = build_distribution_table(
+            self._frame(), "val", periods=("year", "verwarmingsperiode"))
+        p1a = out[(out["ProjectIdBSV"] == 1) & (out["WoningType"] == "A")]
+        assert list(p1a["period"]) == ["year", "verwarmingsperiode"]
+
+    def test_variadic_single_group_col(self):
+        out = build_distribution_table(
+            self._frame(), "val",
+            group_cols=("ProjectIdBSV",), periods=("year",))
+        assert list(out.columns) == [
+            "period", "ProjectIdBSV", "n", "gem.", "med.", "p25", "p75", "min", "max"]
+        # Roll-up row labels the single group column.
+        r = self._row(out, period="year", ProjectIdBSV="alle HHs")
+        assert int(r["n"]) == 5
+
+    def test_count_excludes_missing_values(self):
+        # ADR-005: pd.NA in a Float64 column is missing; n counts non-NA only.
+        df = pd.DataFrame({
+            "ProjectIdBSV": [1, 1, 1],
+            "WoningType":   ["A", "A", "A"],
+            "period":       ["year", "year", "year"],
+            "val":          pd.array([10.0, pd.NA, 30.0], dtype="Float64"),
+        })
+        out = build_distribution_table(df, "val", periods=("year",))
+        r = self._row(out, period="year", ProjectIdBSV=1, WoningType="A")
+        assert int(r["n"]) == 2
+        assert r["gem."] == pytest.approx(20.0)

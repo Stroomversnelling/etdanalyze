@@ -12,6 +12,7 @@ import pytest
 
 from etdanalyze.units import (
     UNIT_CLASS,
+    assert_renderable_on_timeline,
     assert_unit_in_classes,
     convert_diff_to_power,
     convert_energy_per_interval_to_power,
@@ -608,3 +609,44 @@ class TestNestedOverrideValidation:
         ov = {"TemperatuurBuitenWarmtepomp": {"type": "momentaan"}}
         # etdmap unit for TemperatuurBuitenWarmtepomp is "graden C".
         assert resolve_unit("TemperatuurBuitenWarmtepomp", overrides=ov) == "graden C"
+
+
+class TestAssertRenderableOnTimeline:
+    """The profile-plot gate (ADR-003). Renderable types pass silently;
+    every other classification raises ValueError with a tailored hint."""
+
+    def test_momentaan_passes(self):
+        # Real etdmap Momentaan=ja column -> renderable, returns None.
+        assert assert_renderable_on_timeline("TemperatuurBuitenWarmtepomp") is None
+
+    def test_interval_mean_override_passes(self):
+        ov = {"c": {"unit": "kW", "type": "interval_mean"}}
+        assert assert_renderable_on_timeline("c", overrides=ov) is None
+
+    def test_cumulative_raises(self):
+        ov = {"c": {"unit": "kWh", "type": "cumulatief"}}
+        with pytest.raises(ValueError, match="cumulative meter reading"):
+            assert_renderable_on_timeline("c", overrides=ov)
+
+    def test_diff_with_registered_unit_points_to_converter(self):
+        # kWh-Diff has a registered converter -> hint names convert_interval_diff.
+        ov = {"c": {"unit": "kWh", "type": "diff"}}
+        with pytest.raises(ValueError, match="convert_interval_diff"):
+            assert_renderable_on_timeline("c", overrides=ov)
+
+    def test_diff_with_unregistered_unit_names_registered_units(self):
+        # GJ is a valid energy unit but has no registered interval-diff
+        # converter -> the error reports that no converter is registered.
+        ov = {"c": {"unit": "GJ", "type": "diff"}}
+        with pytest.raises(ValueError, match="No converter is currently registered"):
+            assert_renderable_on_timeline("c", overrides=ov)
+
+    def test_unclassified_column_raises_with_adr_pointer(self):
+        with pytest.raises(ValueError, match="ADR-003"):
+            assert_renderable_on_timeline("totally_made_up_col")
+
+    def test_error_message_carries_plot_type_and_axis(self):
+        ov = {"c": {"unit": "kWh", "type": "cumulatief"}}
+        with pytest.raises(ValueError, match="plot_daily_profile.*colorbar"):
+            assert_renderable_on_timeline(
+                "c", overrides=ov, plot_type="plot_daily_profile", axis="colorbar")
