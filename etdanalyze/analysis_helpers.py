@@ -21,12 +21,17 @@ def build_distribution_table(
 
     Shape::
 
-        period | <group_cols...> | n | gem. | med. | p25 | p75 | min | max
+        period | <group_cols...> | n | missing | gem. | med. | p25 | p75 | min | max
         year                     | <project> | <woningtype> | ...
         verwarmingsperiode       | <project> | <woningtype> | ...
         koelingsperiode          | <project> | <woningtype> | ...
         year                     | alle HHs  |              | <population roll-up>
         ...
+
+    ``n`` is the non-NA count for the cell; ``missing`` is the NA count.
+    ``n + missing`` is the cell population (households in that
+    (group, period)), so the table carries its own denominator rather
+    than leaving it to a separate coverage table.
 
     Rows are stacked by period within each ``group_cols`` tuple so the
     seasonal profile for a single (project, woningtype) sits in
@@ -65,14 +70,19 @@ def build_distribution_table(
     pd.DataFrame
         Ready to render via ``.to_markdown(index=False)``.
     """
-    cols_out = [period_col, *group_cols, "n", "gem.", "med.", "p25", "p75", "min", "max"]
+    cols_out = [period_col, *group_cols, "n", "missing",
+                "gem.", "med.", "p25", "p75", "min", "max"]
     sub = df.loc[df[period_col].isin(periods)].copy()
     if sub.empty:
         return pd.DataFrame(columns=cols_out)
 
     grouped = sub.groupby([*group_cols, period_col], observed=True, dropna=False)
+    # ``n`` is the non-NA count; ``missing`` is the NA count in the same cell.
+    # n + missing is the cell population -- the denominator a reader needs to
+    # judge n (n=3 means little without knowing it is 3 of 3 or 3 of 300).
     per_group = pd.DataFrame({
         "n":    grouped[value_col].count().astype("Int64"),
+        "missing": (grouped[value_col].size() - grouped[value_col].count()).astype("Int64"),
         "gem.": grouped[value_col].mean(),
         "med.": grouped[value_col].median(),
         "p25":  grouped[value_col].quantile(0.25),
@@ -98,6 +108,7 @@ def build_distribution_table(
             row[g] = population_label if i == 0 else ""
         row.update({
             "n":    int(pwp.count()),
+            "missing": int(pwp.isna().sum()),
             "gem.": float(pwp.mean()),
             "med.": float(pwp.median()),
             "p25":  float(pwp.quantile(0.25)),
@@ -941,7 +952,14 @@ def compute_stats_table(
     Returns long-format DataFrame: one row per (group keys x variable)
     with columns: variable, *group_cols, mean, median, std, min, max,
     p25 (25th percentile), p75 (75th percentile), p01 (1st percentile),
-    p99 (99th percentile), count.
+    p99 (99th percentile), count, missing.
+
+    ``count`` is the non-NA observation count per group; ``missing`` is
+    the NA count (group size - count). They are emitted together so a
+    consumer reading the stats always has the denominator -- a mean over
+    count=3 means little without knowing whether the group held 3 or 300
+    observations. This mirrors ``classify_coverage``'s n_nonnull / n_rows
+    at the stats grain (see parent ADR-018).
 
     Note: ``p25`` and ``p75`` are the inter-quartile boundaries (25/75);
     ``p01`` and ``p99`` are the extreme-tail percentiles. Names match
@@ -973,6 +991,12 @@ def compute_stats_table(
     across shards. See parent ADR-017 for the full sharding /
     fallback ladder.
     """
+    # Total observations per group (incl. NA), computed once -- the group
+    # size is the same for every value col. ``count`` is non-NA, so
+    # ``missing = n_total - count`` is the NA count: the denominator a
+    # reader needs to judge count against the population (parent ADR-018).
+    group_totals = df.groupby(group_cols).size().rename("n_total").reset_index()
+
     results = []
     for col in value_cols:
         if col not in df.columns:
@@ -986,6 +1010,15 @@ def compute_stats_table(
         # iqr is part of NUMERIC_STATS_SCHEMA (parent ADR-018); compute it
         # here so the per-group output matches the per-Series kernel.
         stats["iqr"] = stats["p75"] - stats["p25"]
+        # missing is part of NUMERIC_STATS_SCHEMA. Left-merge totals onto the
+        # groups that survived dropna; missing = total - non-NA count. Both
+        # counts are Int64 (ADR-005). Groups that are entirely NA never reach
+        # this frame (dropna removed them) -- their emptiness is classify_
+        # coverage's job, not this stats table's.
+        stats = stats.merge(group_totals, on=group_cols, how="left")
+        stats["count"] = stats["count"].astype("Int64")
+        stats["missing"] = stats["n_total"].astype("Int64") - stats["count"]
+        stats = stats.drop(columns="n_total")
         stats.insert(0, "variable", col)
         results.append(stats)
     return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
@@ -1001,10 +1034,11 @@ def compute_stats_table_lazy(
 
     Accepts an ibis Table (with any joins / filters / projections already
     applied lazily) and pushes ``count``, ``mean``, ``std``, ``min``,
-    ``max``, ``median``, ``p01``, ``p25``, ``p75``, ``p99`` into a
-    DuckDB ``group_by().aggregate(...)``. Only the small per-group
-    result is executed back to pandas; ``iqr`` is computed in pandas on
-    the small result.
+    ``max``, ``median``, ``p01``, ``p25``, ``p75``, ``p99`` plus the
+    per-group row total into a DuckDB ``group_by().aggregate(...)``. Only
+    the small per-group result is executed back to pandas; ``iqr`` and
+    ``missing`` (= total - count) are computed in pandas on the small
+    result.
 
     Output schema matches :func:`compute_stats_table` and the canonical
     ``NUMERIC_STATS_SCHEMA`` (parent ADR-018) so the schema-parity test
@@ -1068,6 +1102,10 @@ def compute_stats_table_lazy(
         agg_exprs[f"{col}__p25"] = e.quantile(0.25)
         agg_exprs[f"{col}__p75"] = e.quantile(0.75)
         agg_exprs[f"{col}__p99"] = e.quantile(0.99)
+    # Total rows per group (incl. NA), same for every value col. Pushed into
+    # the same aggregate so missing = total - non-NA count matches the eager
+    # path's denominator (NUMERIC_STATS_SCHEMA / parent ADR-018).
+    agg_exprs["__n_total"] = tbl.count()
 
     wide = tbl.group_by(group_cols).aggregate(**agg_exprs).execute()
 
@@ -1081,6 +1119,9 @@ def compute_stats_table_lazy(
                      "p01", "p25", "p75", "p99"):
             sub[stat] = wide[f"{col}__{stat}"]
         sub["iqr"] = sub["p75"] - sub["p25"]
+        # missing = group total - non-NA count, both Int64 (ADR-005).
+        sub["count"] = sub["count"].astype("Int64")
+        sub["missing"] = wide["__n_total"].astype("Int64") - sub["count"]
         sub = sub[sub["count"].fillna(0) > 0].copy()
         sub.insert(0, "variable", col)
         results.append(sub)

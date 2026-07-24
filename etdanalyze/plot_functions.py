@@ -21,6 +21,20 @@ from . import analysis_helpers
 _UNIT_MAP = load_unit_map()
 
 
+def _ensure_parent(save_fig_path) -> None:
+    """Create the directory a figure is about to be written into.
+
+    Output directories are resolved but not created up front (see
+    ``analysis_runner.init_section``), so the first thing that actually writes
+    a file must make its own parent. Doing it here means every plot helper is
+    safe regardless of whether the caller pre-created the folder.
+    """
+    import os
+    parent = os.path.dirname(str(save_fig_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def unit_for_column(col: str) -> str:
     """
     Return the unit string for a known model column, '' otherwise.
@@ -518,6 +532,7 @@ def plot_daily_profile(df, plot_var, title=None, plot_var_name=None, project_id=
 
     # Save or return figure
     if save_fig_path:
+        _ensure_parent(save_fig_path)
         fig.savefig(save_fig_path, dpi=300)
         print(f"Saved plot to {save_fig_path}")
         plt.close(fig)
@@ -624,6 +639,7 @@ def plot_daily_profile_bands(
     plt.tight_layout()
 
     if save_fig_path:
+        _ensure_parent(save_fig_path)
         fig.savefig(save_fig_path, dpi=300)
         print(f"Saved plot to {save_fig_path}")
         plt.close(fig)
@@ -769,6 +785,7 @@ def plot_daily_profile_mean_combined(
 
     # Save or return figure
     if save_fig_path:
+        _ensure_parent(save_fig_path)
         fig.savefig(save_fig_path, dpi=300)
         print(f"Saved plot to {save_fig_path}")
         plt.close(fig)
@@ -886,6 +903,7 @@ def plot_weekly_profile(
     plt.tight_layout()
 
     if save_fig_path:
+        _ensure_parent(save_fig_path)
         fig.savefig(save_fig_path, dpi=300)
         print(f"Saved plot to {save_fig_path}")
         plt.close(fig)
@@ -992,6 +1010,7 @@ def plot_annual_profile(
     plt.tight_layout()
 
     if save_fig_path:
+        _ensure_parent(save_fig_path)
         fig.savefig(save_fig_path, dpi=300)
         print(f"Saved plot to {save_fig_path}")
         plt.close(fig)
@@ -1246,6 +1265,7 @@ def plot_cop_vs_temp(
     plt.tight_layout()
 
     if save_fig_path:
+        _ensure_parent(save_fig_path)
         fig.savefig(save_fig_path, dpi=300)
         print(f"Saved plot to {save_fig_path}")
         plt.close(fig)
@@ -1336,6 +1356,7 @@ def plot_cop_vs_delta_t(
     plt.tight_layout()
 
     if save_fig_path:
+        _ensure_parent(save_fig_path)
         fig.savefig(save_fig_path, dpi=300)
         print(f"Saved plot to {save_fig_path}")
         plt.close(fig)
@@ -1451,6 +1472,7 @@ def plot_energy_signature(
     plt.tight_layout()
 
     if save_fig_path:
+        _ensure_parent(save_fig_path)
         fig.savefig(save_fig_path, dpi=300)
         print(f"Saved plot to {save_fig_path}")
         plt.close(fig)
@@ -1550,6 +1572,7 @@ def plot_monthly_profile(
     plt.tight_layout()
 
     if save_fig_path:
+        _ensure_parent(save_fig_path)
         fig.savefig(save_fig_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
     else:
@@ -2049,6 +2072,7 @@ def plot_boxwhisker_comparison(
         ax2.grid(True, axis="y", alpha=0.3)
 
     if save_fig_path:
+        _ensure_parent(save_fig_path)
         fig.savefig(save_fig_path, dpi=150)
         plt.close(fig)
     else:
@@ -2268,6 +2292,7 @@ def plot_range_strips_candlestick(
         )
 
     if save_fig_path:
+        _ensure_parent(save_fig_path)
         fig.savefig(save_fig_path, dpi=150)
         plt.close(fig)
         return None
@@ -2569,6 +2594,7 @@ def plot_range_strips_blocks(
     cbar.ax.tick_params(labelsize=8)
 
     if save_fig_path:
+        _ensure_parent(save_fig_path)
         fig.savefig(save_fig_path, dpi=150)
         plt.close(fig)
         return None
@@ -2671,6 +2697,7 @@ def plot_load_duration_curve(
 
     # Save or return figure
     if save_fig_path:
+        _ensure_parent(save_fig_path)
         fig.savefig(save_fig_path, dpi=300)
         print(f"Saved plot to {save_fig_path}")
         plt.close(fig)

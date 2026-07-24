@@ -96,3 +96,31 @@ class TestComputeStatsTableLazyParity:
                 f"compute_stats_table_lazy diverged from eager on '{key}': "
                 f"eager={ev}, lazy={lv}"
             )
+
+
+class TestMissingDenominator:
+    """``count`` (non-NA) and ``missing`` (NA) together give the group
+    denominator. Parity fixtures above are NA-free; this exercises the
+    NA path for both engines (parent ADR-018 amendment)."""
+
+    def _df(self):
+        return pd.DataFrame({
+            "g": ["A", "A", "A", "A", "B", "B"],
+            "x": pd.array([1.0, 2.0, pd.NA, 4.0, pd.NA, pd.NA], dtype="Float64"),
+        })
+
+    def test_eager_missing_is_na_count_and_int64(self):
+        out = compute_stats_table(self._df(), ["g"], ["x"]).set_index("g")
+        assert int(out.loc["A", "count"]) == 3
+        assert int(out.loc["A", "missing"]) == 1   # one pd.NA in group A
+        assert str(out["missing"].dtype) == "Int64"   # ADR-005
+        # Group B is entirely NA -> dropped (denominator emptiness is
+        # classify_coverage's job, not this table's).
+        assert "B" not in out.index
+
+    def test_lazy_matches_eager_on_missing(self):
+        df = self._df()
+        eager = compute_stats_table(df, ["g"], ["x"]).set_index("g")
+        lazy = compute_stats_table_lazy(ibis.memtable(df), ["g"], ["x"]).set_index("g")
+        assert int(lazy.loc["A", "missing"]) == int(eager.loc["A", "missing"]) == 1
+        assert "B" not in lazy.index

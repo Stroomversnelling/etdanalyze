@@ -659,7 +659,7 @@ class TestBuildDistributionTable:
     roll-up row per period. Returns a tidy frame ready for .to_markdown()."""
 
     _COLS = ["period", "ProjectIdBSV", "WoningType",
-             "n", "gem.", "med.", "p25", "p75", "min", "max"]
+             "n", "missing", "gem.", "med.", "p25", "p75", "min", "max"]
 
     def _frame(self):
         # P1/A/year: 10,20,30 ; P2/B/year: 40,60 ; P1/A/verw: 100,200.
@@ -696,6 +696,7 @@ class TestBuildDistributionTable:
             self._frame(), "val", periods=("year", "verwarmingsperiode"))
         r = self._row(out, period="year", ProjectIdBSV=1, WoningType="A")
         assert int(r["n"]) == 3
+        assert int(r["missing"]) == 0   # no NA in this cell
         assert r["gem."] == pytest.approx(20.0)
         assert r["med."] == pytest.approx(20.0)
         assert r["p25"] == pytest.approx(15.0)
@@ -732,7 +733,8 @@ class TestBuildDistributionTable:
             self._frame(), "val",
             group_cols=("ProjectIdBSV",), periods=("year",))
         assert list(out.columns) == [
-            "period", "ProjectIdBSV", "n", "gem.", "med.", "p25", "p75", "min", "max"]
+            "period", "ProjectIdBSV", "n", "missing",
+            "gem.", "med.", "p25", "p75", "min", "max"]
         # Roll-up row labels the single group column.
         r = self._row(out, period="year", ProjectIdBSV="alle HHs")
         assert int(r["n"]) == 5
@@ -748,4 +750,5 @@ class TestBuildDistributionTable:
         out = build_distribution_table(df, "val", periods=("year",))
         r = self._row(out, period="year", ProjectIdBSV=1, WoningType="A")
         assert int(r["n"]) == 2
+        assert int(r["missing"]) == 1   # the pd.NA observation
         assert r["gem."] == pytest.approx(20.0)
