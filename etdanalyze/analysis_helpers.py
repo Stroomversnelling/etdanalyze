@@ -427,11 +427,23 @@ def multiplier_to_convert_to_KWH(interval):
     float
         The number with which the data needs to be multiplied
         in order to normalize to hourly data.
+
+    Raises
+    ------
+    ValueError
+        If ``interval`` is not of the form ``"<number><unit>"`` with unit
+        ``"min"`` or ``"h"``. Pipeline stage names (e.g. ``"default"``,
+        ``"imputed"``, ``"calculated"``) are not intervals and are rejected;
+        the caller must know and pass the actual cadence of such data.
     """
     # split string in numeric & string part (e.g. (5, "min"))
     match = re.match(r"(\d+)([a-zA-Z]+)", interval)
-    if match:
-        number, word = match.groups()
+    if not match:
+        raise ValueError(
+            f"expected an interval of the form '<number><unit>' with unit "
+            f"'min' or 'h' (e.g. '5min', '60min', '24h'); got: {interval!r}"
+        )
+    number, word = match.groups()
     if word == 'h':
         muliplier = 1/int(number)
     elif word == 'min':
