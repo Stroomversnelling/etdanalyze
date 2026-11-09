@@ -20,7 +20,13 @@ dependencies = [
     "ibis-framework[duckdb]",
     "openpyxl",
     "matplotlib",
-    "etdtransform @ git+https://github.com/Stroomversnelling/etdtransform@main",
+    "PyYAML",
+    # etdtransform is a peer source-installed dependency in this project
+    # (ADR-004 dependency chain: etdmap -> etdtransform -> etdanalyze).
+    # Listed as a plain requirement so pip will not try to re-fetch from a
+    # git URL when a local install is already present in the venv. Install
+    # from source: pip install ../etdtransform
+    "etdtransform",
 ]
 keywords = ["stroomversnelling", "energietransitie", "warmtepomp"]
 
